@@ -293,6 +293,7 @@ def create_train_val_dataloaders(
     val_split: float = 0.1,
     num_workers: int = 4,
     device: str = None,
+    frames_per_sample: int = 1,
     **kwargs,
 ) -> Tuple[DataLoader, DataLoader]:
     """Create train and validation DataLoaders.
@@ -303,13 +304,14 @@ def create_train_val_dataloaders(
         val_split: Fraction for validation
         num_workers: Number of workers
         device: Device for GPU caching (None for CPU)
+        frames_per_sample: Consecutive frames per sample (for overlap-add training)
         **kwargs: Additional args for MDCTDataset
 
     Returns:
         (train_loader, val_loader)
     """
     # Create full dataset
-    dataset = MDCTDataset(data_dir=data_dir, device=device, **kwargs)
+    dataset = MDCTDataset(data_dir=data_dir, device=device, frames_per_sample=frames_per_sample, **kwargs)
 
     # Split
     total = len(dataset)

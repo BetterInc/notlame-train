@@ -20,7 +20,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from .model import PsychoNet, create_model, count_parameters
-from .differentiable_mp3 import DifferentiableMP3, DifferentiableMDCT, compute_mdct_energy
+from .differentiable_mp3 import DifferentiableMP3, DifferentiableMDCT, compute_mdct_energy, process_coeffs_through_model
 from .losses import MDCTLoss, PerceptualLoss, RateDistortionLoss, MultiResolutionSTFTLoss, MelSpectrogramLoss, MultiScaleMelLoss
 from .dataset import create_dataloader, create_train_val_dataloaders
 from . import config
@@ -40,11 +40,13 @@ class Trainer:
         checkpoint_dir: Path = Path("checkpoints"),
         log_dir: Path = Path("runs"),
         experiment_name: Optional[str] = None,
+        frames_per_sample: int = 4,
     ):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.model = model.to(self.device)
         self.train_loader = train_loader
         self.val_loader = val_loader
+        self.frames_per_sample = frames_per_sample
 
         # Optimizer
         self.optimizer = optim.AdamW(
@@ -116,10 +118,10 @@ class Trainer:
         print(f"TensorBoard: {self.log_dir}")
 
     def train_step(self, batch: torch.Tensor) -> dict:
-        """Single training step.
+        """Single training step with proper overlap-add reconstruction.
 
         Args:
-            batch: (batch, 576) MDCT coefficients
+            batch: (batch, num_frames, 576) MDCT coefficients
 
         Returns:
             dict of losses
@@ -127,38 +129,31 @@ class Trainer:
         self.model.train()
         batch = batch.to(self.device)
 
-        # Handle multi-frame batches
-        if batch.dim() == 3:
-            batch = batch[:, 0, :]  # Take first frame
+        # Use shared pipeline for proper overlap-add reconstruction
+        reconstructed_audio, original_audio, all_scalefactors, all_quantized = \
+            process_coeffs_through_model(batch, self.model, self.mdct, self.mp3_pipeline)
 
-        # Forward pass - model outputs scalefactors only
-        output = self.model(batch)
-        scalefactors = output["scalefactors"]
+        # Handle single-frame for coefficients
+        if batch.dim() == 2:
+            batch = batch.unsqueeze(1)
 
-        # Quantize and reconstruct MDCT coefficients
-        quantized = self.mp3_pipeline.encode_coeffs(batch, scalefactors, thresholds=None)
+        # MDCT-domain loss (average over frames)
+        mdct_losses = []
+        for i in range(all_quantized.shape[1]):
+            rd_losses = self.rd_loss(all_quantized[:, i, :], batch[:, i, :], all_scalefactors[:, i, :])
+            mdct_losses.append(rd_losses["distortion"])
+        mdct_loss = torch.stack(mdct_losses).mean()
 
-        # MDCT-domain loss (rate-distortion)
-        rd_losses = self.rd_loss(quantized, batch, scalefactors)
-        mdct_loss = rd_losses["distortion"]
-
-        # Convert to audio domain for perceptual losses
-        # Inverse MDCT: (batch, 576) -> (batch, 1152)
-        original_audio = self.mdct.inverse(batch)
-        reconstructed_audio = self.mdct.inverse(quantized)
-
-        # MR-STFT loss (spectral convergence + log magnitude)
+        # MR-STFT loss on properly reconstructed audio
         sc_loss, mag_loss = self.stft_loss(reconstructed_audio, original_audio)
         stft_loss = sc_loss + mag_loss
 
-        # Mel spectrogram loss
+        # Mel spectrogram loss on properly reconstructed audio
         mel_loss = self.mel_loss(reconstructed_audio, original_audio)
 
-        # Rate penalty - penalize low scalefactors (encourages compression)
-        # Low SF = more bits = better quality but inefficient
-        # We want model to learn: use low SF only where it matters
-        sf_mean = scalefactors.mean()
-        rate_penalty = torch.relu(self.target_sf - sf_mean)  # Penalize if SF < target
+        # Rate penalty
+        sf_mean = all_scalefactors.mean()
+        rate_penalty = torch.relu(self.target_sf - sf_mean)
 
         # Combined loss
         total_loss = (
@@ -207,20 +202,23 @@ class Trainer:
 
         for batch in self.val_loader:
             batch = batch.to(self.device)
-            if batch.dim() == 3:
-                batch = batch[:, 0, :]
 
-            output = self.model(batch)
-            scalefactors = output["scalefactors"]
+            # Use shared pipeline for proper overlap-add
+            reconstructed_audio, original_audio, all_scalefactors, all_quantized = \
+                process_coeffs_through_model(batch, self.model, self.mdct, self.mp3_pipeline)
 
-            quantized = self.mp3_pipeline.encode_coeffs(batch, scalefactors, thresholds=None)
-            rd_losses = self.rd_loss(quantized, batch, scalefactors)
-            mdct_loss = rd_losses["distortion"]
+            # Handle single-frame for coefficients
+            if batch.dim() == 2:
+                batch = batch.unsqueeze(1)
 
-            # Perceptual losses
-            original_audio = self.mdct.inverse(batch)
-            reconstructed_audio = self.mdct.inverse(quantized)
+            # MDCT-domain loss
+            mdct_losses = []
+            for i in range(all_quantized.shape[1]):
+                rd_losses = self.rd_loss(all_quantized[:, i, :], batch[:, i, :], all_scalefactors[:, i, :])
+                mdct_losses.append(rd_losses["distortion"])
+            mdct_loss = torch.stack(mdct_losses).mean()
 
+            # Perceptual losses on properly reconstructed audio
             sc_loss, mag_loss = self.stft_loss(reconstructed_audio, original_audio)
             stft_loss = sc_loss + mag_loss
             mel_loss = self.mel_loss(reconstructed_audio, original_audio)
@@ -449,6 +447,12 @@ Examples:
         default=4,
         help="Data loading workers (default: 4)",
     )
+    parser.add_argument(
+        "--frames",
+        type=int,
+        default=4,
+        help="Consecutive frames per sample for proper overlap-add (default: 4)",
+    )
 
     # Checkpointing
     parser.add_argument(
@@ -490,7 +494,7 @@ Examples:
         sys.exit(1)
 
     # Create data loaders
-    print("Creating data loaders...")
+    print(f"Creating data loaders (frames_per_sample={args.frames})...")
     # When caching to GPU, use workers=0 (no CPU-GPU transfer needed)
     workers = 0 if args.cache else args.workers
     train_loader, val_loader = create_train_val_dataloaders(
@@ -500,6 +504,7 @@ Examples:
         num_workers=workers,
         cache_in_memory=args.cache,
         device=args.device if args.cache else None,
+        frames_per_sample=args.frames,
     )
 
     # Enable TensorFloat32 for faster matmul on RTX 3090

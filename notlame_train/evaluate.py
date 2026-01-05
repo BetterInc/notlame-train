@@ -29,7 +29,7 @@ import torch
 from tqdm import tqdm
 
 from .model import create_model
-from .differentiable_mp3 import DifferentiableMP3, DifferentiableMDCT
+from .differentiable_mp3 import DifferentiableMP3, DifferentiableMDCT, process_audio_through_model
 from . import config
 
 
@@ -324,52 +324,13 @@ class Evaluator:
         """Encode audio with neural model and decode back."""
         # Convert to tensor
         audio_tensor = torch.from_numpy(audio).float().to(self.device)
-        if audio_tensor.dim() == 1:
-            audio_tensor = audio_tensor.unsqueeze(0)
 
-        frame_size = 1152
-        hop_size = 576
-        output_frames = []
+        # Use shared pipeline for proper overlap-add reconstruction
+        reconstructed, _, _, _, _ = process_audio_through_model(
+            audio_tensor, self.model, self.mdct, self.mp3
+        )
 
-        # Pad at BOTH ends for proper MDCT overlap-add reconstruction
-        # Start padding ensures first real samples have overlap
-        # End padding ensures we process all samples
-        original_len = audio_tensor.shape[1]
-        start_pad = hop_size  # Pad one hop at start
-        end_pad = frame_size - ((original_len + start_pad) % hop_size)
-        if end_pad >= frame_size:
-            end_pad = 0
-        audio_tensor = torch.nn.functional.pad(audio_tensor, (start_pad, end_pad))
-
-        # Process frame by frame
-        for i in range(0, audio_tensor.shape[1] - frame_size + 1, hop_size):
-            frame = audio_tensor[:, i:i + frame_size]
-
-            # MDCT
-            coeffs = self.mdct(frame)
-
-            # Neural model prediction - outputs scalefactors only
-            output = self.model(coeffs)
-            scalefactors = output["scalefactors"]
-
-            # Quantize and reconstruct
-            quantized = self.mp3.encode_coeffs(coeffs, scalefactors, thresholds=None)
-
-            # Inverse MDCT
-            reconstructed = self.mdct.inverse(quantized)
-            output_frames.append(reconstructed)
-
-        # Overlap-add reconstruction
-        output_len = len(output_frames) * hop_size + hop_size
-        output = torch.zeros(1, output_len, device=self.device)
-
-        for i, frame in enumerate(output_frames):
-            start = i * hop_size
-            output[:, start:start + frame_size] += frame
-
-        # Remove start padding and trim to original length
-        output = output[:, start_pad:start_pad + original_len]
-        return output[0].cpu().numpy()
+        return reconstructed[0].cpu().numpy()
 
     def evaluate_file(self, audio_path: Path, bitrate: int = 192) -> dict:
         """Evaluate on a single audio file with all metrics."""

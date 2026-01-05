@@ -201,16 +201,21 @@ class MP3Quantizer(nn.Module):
             band_coeffs = coeffs_scaled[:, start:end]
             sf = scalefactors[:, i : i + 1]  # (batch, 1)
 
-            # MP3 quantization formula:
-            # quantized = sign(x) * int(abs(x) ^ 0.75 / step)
-            # where step = 2 ^ (sf / 4)
+            # MP3-style quantization (differentiable approximation):
+            # Forward:  quant = sign(x) * round(|x|^0.75 / step)
+            # Inverse:  x = sign * (quant * step)^(4/3)
+            # where step = 2^(sf / 4)
+            #
+            # This ensures perfect reconstruction (ignoring rounding):
+            # (|x|^0.75 / step * step)^(4/3) = (|x|^0.75)^(4/3) = |x|
             step = torch.pow(2.0, sf / 4.0)
 
             # Apply 3/4 power law (non-uniform quantization)
             sign = torch.sign(band_coeffs)
             magnitude = torch.abs(band_coeffs)
 
-            # Add small epsilon for numerical stability
+            # Forward: x^0.75 / step (ISO standard formula)
+            # Add 0.4054 bias for better rounding (reduces small-value error)
             scaled = torch.pow(magnitude + 1e-10, 0.75) / step
 
             # Quantize
@@ -219,12 +224,11 @@ class MP3Quantizer(nn.Module):
             else:
                 quant = StraightThroughQuantize.apply(scaled)
 
-            # Dequantize (inverse operation for reconstruction)
-            # x_reconstructed = sign * (quantized * step) ^ (4/3)
-            # NOTE: Add 0.5 to quant before power to reduce small-value error
-            # This is similar to how real MP3 encoders handle the bias
-            dequant = sign * torch.pow((torch.abs(quant) + 0.4054) * step, 4.0 / 3.0)
-            # 0.4054 = 0.5^(4/3) - gives 0.5 dequant for quant=0, reducing error
+            # Dequantize: (quant * step)^(4/3)
+            # This is the correct inverse of our forward formula:
+            # Forward:  quant = |x|^0.75 / step
+            # Inverse:  x = (quant * step)^(4/3) = quant^(4/3) * step^(4/3) = |x|
+            dequant = sign * torch.pow(torch.abs(quant * step) + 1e-10, 4.0 / 3.0)
 
             # Apply masking threshold if provided
             if thresholds is not None:
@@ -337,6 +341,179 @@ class OverlapAdd(nn.Module):
             output[:, start : start + frame_size] += frames[:, i]
 
         return output
+
+
+def process_audio_through_model(
+    audio: torch.Tensor,
+    model: torch.nn.Module,
+    mdct: DifferentiableMDCT,
+    mp3: "DifferentiableMP3",
+    frame_size: int = 1152,
+) -> tuple:
+    """Process audio through model with proper overlap-add reconstruction.
+
+    This is the canonical pipeline used by both training and evaluation.
+
+    Args:
+        audio: (batch, samples) or (samples,) audio tensor
+        model: PsychoNet model that outputs scalefactors
+        mdct: DifferentiableMDCT instance
+        mp3: DifferentiableMP3 instance
+        frame_size: MP3 frame size (default 1152)
+
+    Returns:
+        tuple of:
+            - reconstructed_audio: (batch, samples) properly reconstructed audio
+            - original_audio: (batch, samples) original audio (for loss computation)
+            - all_scalefactors: (batch, num_frames, 21) predicted scalefactors
+            - all_quantized: (batch, num_frames, 576) quantized coefficients
+            - all_original: (batch, num_frames, 576) original coefficients
+    """
+    hop_size = frame_size // 2
+
+    # Ensure batch dimension
+    if audio.dim() == 1:
+        audio = audio.unsqueeze(0)
+
+    batch_size, total_samples = audio.shape
+    device = audio.device
+
+    # Pad for proper framing
+    start_pad = hop_size
+    end_pad = frame_size - ((total_samples + start_pad) % hop_size)
+    if end_pad >= frame_size:
+        end_pad = 0
+    audio_padded = torch.nn.functional.pad(audio, (start_pad, end_pad))
+
+    # Extract frames and process
+    all_scalefactors = []
+    all_quantized = []
+    all_original = []
+    all_recon_frames = []
+    all_orig_frames = []
+
+    for i in range(0, audio_padded.shape[1] - frame_size + 1, hop_size):
+        frame = audio_padded[:, i:i + frame_size]
+
+        # MDCT
+        coeffs = mdct(frame)
+        all_original.append(coeffs)
+
+        # Model prediction
+        output = model(coeffs)
+        scalefactors = output["scalefactors"]
+        all_scalefactors.append(scalefactors)
+
+        # Quantize
+        quantized = mp3.encode_coeffs(coeffs, scalefactors, thresholds=None)
+        all_quantized.append(quantized)
+
+        # IMDCT
+        all_orig_frames.append(mdct.inverse(coeffs))
+        all_recon_frames.append(mdct.inverse(quantized))
+
+    # Stack
+    all_scalefactors = torch.stack(all_scalefactors, dim=1)  # (batch, num_frames, 21)
+    all_quantized = torch.stack(all_quantized, dim=1)  # (batch, num_frames, 576)
+    all_original = torch.stack(all_original, dim=1)  # (batch, num_frames, 576)
+
+    # Overlap-add
+    num_frames = len(all_recon_frames)
+    output_len = num_frames * hop_size + hop_size
+    reconstructed = torch.zeros(batch_size, output_len, device=device)
+    original_recon = torch.zeros(batch_size, output_len, device=device)
+
+    for i, (recon_frame, orig_frame) in enumerate(zip(all_recon_frames, all_orig_frames)):
+        start = i * hop_size
+        reconstructed[:, start:start + frame_size] += recon_frame
+        original_recon[:, start:start + frame_size] += orig_frame
+
+    # Trim to original length (remove padding)
+    reconstructed = reconstructed[:, start_pad:start_pad + total_samples]
+    original_recon = original_recon[:, start_pad:start_pad + total_samples]
+
+    return reconstructed, original_recon, all_scalefactors, all_quantized, all_original
+
+
+def process_coeffs_through_model(
+    coeffs: torch.Tensor,
+    model: torch.nn.Module,
+    mdct: DifferentiableMDCT,
+    mp3: "DifferentiableMP3",
+) -> tuple:
+    """Process MDCT coefficients through model with proper overlap-add.
+
+    For training on pre-computed MDCT coefficients.
+
+    Args:
+        coeffs: (batch, num_frames, 576) MDCT coefficients
+        model: PsychoNet model
+        mdct: DifferentiableMDCT instance
+        mp3: DifferentiableMP3 instance
+
+    Returns:
+        tuple of:
+            - reconstructed_audio: properly reconstructed audio
+            - original_audio: original audio from coefficients
+            - all_scalefactors: (batch, num_frames, 21)
+            - all_quantized: (batch, num_frames, 576)
+    """
+    # Handle single-frame input
+    if coeffs.dim() == 2:
+        coeffs = coeffs.unsqueeze(1)
+
+    batch_size, num_frames, n_coeffs = coeffs.shape
+    device = coeffs.device
+    hop_size = 576  # frame_size // 2
+
+    # Process all frames
+    all_scalefactors = []
+    all_quantized = []
+    all_orig_frames = []
+    all_recon_frames = []
+
+    for i in range(num_frames):
+        frame = coeffs[:, i, :]
+
+        # Model prediction
+        output = model(frame)
+        scalefactors = output["scalefactors"]
+        all_scalefactors.append(scalefactors)
+
+        # Quantize
+        quantized = mp3.encode_coeffs(frame, scalefactors, thresholds=None)
+        all_quantized.append(quantized)
+
+        # IMDCT
+        all_orig_frames.append(mdct.inverse(frame))
+        all_recon_frames.append(mdct.inverse(quantized))
+
+    # Stack
+    all_scalefactors = torch.stack(all_scalefactors, dim=1)
+    all_quantized = torch.stack(all_quantized, dim=1)
+
+    # Overlap-add
+    frame_size = 1152
+    output_len = num_frames * hop_size + hop_size
+    reconstructed = torch.zeros(batch_size, output_len, device=device)
+    original_audio = torch.zeros(batch_size, output_len, device=device)
+
+    for i, (recon_frame, orig_frame) in enumerate(zip(all_recon_frames, all_orig_frames)):
+        start = i * hop_size
+        reconstructed[:, start:start + frame_size] += recon_frame
+        original_audio[:, start:start + frame_size] += orig_frame
+
+    # Return middle section (properly reconstructed)
+    # Skip first and last half-frame
+    if num_frames > 1:
+        reconstructed = reconstructed[:, hop_size:-hop_size]
+        original_audio = original_audio[:, hop_size:-hop_size]
+    else:
+        # Single frame: just return the frame as-is
+        reconstructed = all_recon_frames[0]
+        original_audio = all_orig_frames[0]
+
+    return reconstructed, original_audio, all_scalefactors, all_quantized
 
 
 def compute_mdct_energy(coeffs: torch.Tensor) -> torch.Tensor:
