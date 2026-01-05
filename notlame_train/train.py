@@ -23,6 +23,7 @@ from .model import PsychoNet, create_model, count_parameters
 from .differentiable_mp3 import DifferentiableMP3, DifferentiableMDCT, compute_mdct_energy
 from .losses import MDCTLoss, PerceptualLoss, RateDistortionLoss, MultiResolutionSTFTLoss, MelSpectrogramLoss, MultiScaleMelLoss
 from .dataset import create_dataloader, create_train_val_dataloaders
+from . import config
 
 
 class Trainer:
@@ -67,34 +68,29 @@ class Trainer:
         ).to(self.device)
 
         # Perceptual losses (on audio domain)
-        # Based on DAC/EnCodec research: multi-scale is key for quality
+        # Configuration from config.py ensures training/eval consistency
         self.stft_loss = MultiResolutionSTFTLoss(
-            fft_sizes=[64, 128, 256, 512],  # Small for 1152-sample frames
-            hop_sizes=[16, 32, 64, 128],
-            win_sizes=[64, 128, 256, 512],
+            fft_sizes=config.STFT_FFT_SIZES,
+            hop_sizes=config.STFT_HOP_SIZES,
+            win_sizes=config.STFT_WIN_SIZES,
         ).to(self.device)
 
-        # Multi-scale mel loss (DAC-style) - most important for perceptual quality
-        # Research: more scales = better quality, L1+L2 prevents over-smoothing
+        # Multi-scale mel loss (DAC-style)
         self.mel_loss = MultiScaleMelLoss(
-            sample_rate=44100,
-            window_lengths=[32, 64, 128, 256, 512],  # Added 32 for fine detail
-            n_mels=64,
-            use_l2=True,  # L1+L2 combination per MelCap research
+            sample_rate=config.MEL_SAMPLE_RATE,
+            window_lengths=config.MEL_WINDOW_LENGTHS,
+            n_mels=config.MEL_N_MELS,
+            use_l2=config.MEL_USE_L2,
         ).to(self.device)
 
-        # Loss weights based on DAC/LRAC research
-        # DAC: λmel=15-45, λstft=1
-        # LRAC 2025: mel=5, adv=1, feat=2
-        # Without discriminator, increase mel weight further
-        self.mdct_weight = 0.1      # MDCT reconstruction (anchor)
-        self.stft_weight = 1.0      # MR-STFT (log+linear magnitude)
-        self.mel_weight = 15.0      # Multi-scale Mel (primary perceptual loss, increased from 10)
+        # Loss weights from config
+        self.mdct_weight = config.LOSS_WEIGHTS["mdct"]
+        self.stft_weight = config.LOSS_WEIGHTS["stft"]
+        self.mel_weight = config.LOSS_WEIGHTS["mel"]
 
-        # Rate penalty - encourages higher scalefactors (compression)
-        # Without this, model just uses SF=0 everywhere (max quality, no compression)
-        self.rate_weight = 0.1      # Penalty for low scalefactors
-        self.target_sf = 7.5        # Target average scalefactor
+        # Rate penalty
+        self.rate_weight = config.LOSS_WEIGHTS["rate"]
+        self.target_sf = config.TARGET_SCALEFACTOR
 
         self.mp3_pipeline = DifferentiableMP3().to(self.device)
         self.mdct = DifferentiableMDCT().to(self.device)

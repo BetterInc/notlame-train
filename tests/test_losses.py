@@ -8,6 +8,7 @@ import torch
 
 from notlame_train.differentiable_mp3 import DifferentiableMP3, DifferentiableMDCT
 from notlame_train.losses import MultiResolutionSTFTLoss, MelSpectrogramLoss, MultiScaleMelLoss
+from notlame_train import config
 
 
 def compute_snr(original: torch.Tensor, reconstructed: torch.Tensor) -> float:
@@ -37,15 +38,15 @@ def test_losses():
     mdct = DifferentiableMDCT()
 
     stft_loss = MultiResolutionSTFTLoss(
-        fft_sizes=[64, 128, 256, 512],
-        hop_sizes=[16, 32, 64, 128],
-        win_sizes=[64, 128, 256, 512],
+        fft_sizes=config.STFT_FFT_SIZES,
+        hop_sizes=config.STFT_HOP_SIZES,
+        win_sizes=config.STFT_WIN_SIZES,
     )
     mel_loss = MultiScaleMelLoss(
-        sample_rate=44100,
-        window_lengths=[32, 64, 128, 256, 512],  # Added 32 per DAC research
-        n_mels=64,
-        use_l2=True,  # L1+L2 per MelCap research
+        sample_rate=config.MEL_SAMPLE_RATE,
+        window_lengths=config.MEL_WINDOW_LENGTHS,
+        n_mels=config.MEL_N_MELS,
+        use_l2=config.MEL_USE_L2,
     )
 
     all_passed = True
@@ -206,23 +207,23 @@ def test_training_step():
     mdct = DifferentiableMDCT()
 
     stft_loss = MultiResolutionSTFTLoss(
-        fft_sizes=[64, 128, 256, 512],
-        hop_sizes=[16, 32, 64, 128],
-        win_sizes=[64, 128, 256, 512],
+        fft_sizes=config.STFT_FFT_SIZES,
+        hop_sizes=config.STFT_HOP_SIZES,
+        win_sizes=config.STFT_WIN_SIZES,
     )
     mel_loss = MultiScaleMelLoss(
-        sample_rate=44100,
-        window_lengths=[32, 64, 128, 256, 512],  # Updated to match train.py
-        n_mels=64,
-        use_l2=True,
+        sample_rate=config.MEL_SAMPLE_RATE,
+        window_lengths=config.MEL_WINDOW_LENGTHS,
+        n_mels=config.MEL_N_MELS,
+        use_l2=config.MEL_USE_L2,
     )
 
-    # Weights from train.py (updated based on DAC/LRAC research)
-    mdct_weight = 0.1
-    stft_weight = 1.0
-    mel_weight = 15.0  # Increased from 10 per DAC research
-    rate_weight = 0.1
-    target_sf = 7.5
+    # Weights from config
+    mdct_weight = config.LOSS_WEIGHTS["mdct"]
+    stft_weight = config.LOSS_WEIGHTS["stft"]
+    mel_weight = config.LOSS_WEIGHTS["mel"]
+    rate_weight = config.LOSS_WEIGHTS["rate"]
+    target_sf = config.TARGET_SCALEFACTOR
 
     # Forward pass
     output = model(coeffs)

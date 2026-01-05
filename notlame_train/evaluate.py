@@ -30,18 +30,13 @@ from tqdm import tqdm
 
 from .model import create_model
 from .differentiable_mp3 import DifferentiableMP3, DifferentiableMDCT
+from . import config
 
 
 # =============================================================================
-# Target Metrics (based on research)
+# Target Metrics (from config)
 # =============================================================================
-TARGETS = {
-    "visqol": 4.0,      # MOS 1-5, >4.0 is good
-    "snr": 20.0,        # dB, >20 is good
-    "mr_stft": 0.5,     # Lower is better, <0.5 is good
-    "mel": 1.0,         # Lower is better, <1.0 is good
-    "win_rate": 0.50,   # >50% means better than LAME
-}
+TARGETS = config.EVAL_TARGETS
 
 
 # =============================================================================
@@ -105,13 +100,18 @@ def compute_log_spectral_distance(reference: np.ndarray, degraded: np.ndarray,
 # =============================================================================
 
 def compute_multi_resolution_stft(reference: np.ndarray, degraded: np.ndarray,
-                                   fft_sizes: List[int] = [512, 1024, 2048],
-                                   hop_sizes: List[int] = [128, 256, 512]) -> Dict[str, float]:
+                                   fft_sizes: List[int] = None,
+                                   hop_sizes: List[int] = None) -> Dict[str, float]:
     """Multi-resolution STFT distance.
 
     Combines spectral convergence and log magnitude loss at multiple resolutions.
     Used by EnCodec, SoundStream, DAC for training and evaluation.
     """
+    # Use config defaults if not specified
+    if fft_sizes is None:
+        fft_sizes = config.STFT_FFT_SIZES
+    if hop_sizes is None:
+        hop_sizes = config.STFT_HOP_SIZES
     from scipy import signal
 
     min_len = min(len(reference), len(degraded))
@@ -151,12 +151,22 @@ def compute_multi_resolution_stft(reference: np.ndarray, degraded: np.ndarray,
 # =============================================================================
 
 def compute_mel_distance(reference: np.ndarray, degraded: np.ndarray,
-                         sr: int = 44100, n_mels: int = 80,
-                         n_fft: int = 2048, hop: int = 512) -> float:
+                         sr: int = None, n_mels: int = None,
+                         n_fft: int = None, hop: int = None) -> float:
     """Mel spectrogram L1 distance.
 
     Perceptually-weighted metric used in neural audio codec evaluation.
+    Uses largest window from config for evaluation (best frequency resolution).
     """
+    # Use config defaults
+    if sr is None:
+        sr = config.MEL_SAMPLE_RATE
+    if n_mels is None:
+        n_mels = config.MEL_N_MELS
+    if n_fft is None:
+        n_fft = max(config.MEL_WINDOW_LENGTHS)  # Largest window for eval
+    if hop is None:
+        hop = n_fft // 4
     try:
         import librosa
 
@@ -321,10 +331,15 @@ class Evaluator:
         hop_size = 576
         output_frames = []
 
-        # Pad to frame boundary
-        pad_len = frame_size - (audio_tensor.shape[1] % hop_size)
-        if pad_len < frame_size:
-            audio_tensor = torch.nn.functional.pad(audio_tensor, (0, pad_len))
+        # Pad at BOTH ends for proper MDCT overlap-add reconstruction
+        # Start padding ensures first real samples have overlap
+        # End padding ensures we process all samples
+        original_len = audio_tensor.shape[1]
+        start_pad = hop_size  # Pad one hop at start
+        end_pad = frame_size - ((original_len + start_pad) % hop_size)
+        if end_pad >= frame_size:
+            end_pad = 0
+        audio_tensor = torch.nn.functional.pad(audio_tensor, (start_pad, end_pad))
 
         # Process frame by frame
         for i in range(0, audio_tensor.shape[1] - frame_size + 1, hop_size):
@@ -352,7 +367,9 @@ class Evaluator:
             start = i * hop_size
             output[:, start:start + frame_size] += frame
 
-        return output[0, :len(audio)].cpu().numpy()
+        # Remove start padding and trim to original length
+        output = output[:, start_pad:start_pad + original_len]
+        return output[0].cpu().numpy()
 
     def evaluate_file(self, audio_path: Path, bitrate: int = 192) -> dict:
         """Evaluate on a single audio file with all metrics."""

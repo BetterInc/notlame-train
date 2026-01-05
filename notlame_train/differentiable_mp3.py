@@ -221,7 +221,10 @@ class MP3Quantizer(nn.Module):
 
             # Dequantize (inverse operation for reconstruction)
             # x_reconstructed = sign * (quantized * step) ^ (4/3)
-            dequant = sign * torch.pow(torch.abs(quant) * step + 1e-10, 4.0 / 3.0)
+            # NOTE: Add 0.5 to quant before power to reduce small-value error
+            # This is similar to how real MP3 encoders handle the bias
+            dequant = sign * torch.pow((torch.abs(quant) + 0.4054) * step, 4.0 / 3.0)
+            # 0.4054 = 0.5^(4/3) - gives 0.5 dequant for quant=0, reducing error
 
             # Apply masking threshold if provided
             if thresholds is not None:
