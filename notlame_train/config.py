@@ -28,13 +28,15 @@ LOSS_WEIGHTS = {
     "mdct": 0.1,      # MDCT reconstruction (anchor)
     "stft": 1.0,      # MR-STFT (log + linear magnitude)
     "mel": 15.0,      # Multi-scale Mel (primary perceptual loss)
-    "rate": 0.1,      # Rate penalty for compression
+    "rate": 1.0,      # Rate penalty - must be comparable to mel (was 0.1, too weak!)
 }
 
 # =============================================================================
 # Rate-Distortion Configuration
 # =============================================================================
-TARGET_SCALEFACTOR = 7.5  # Target average SF (midpoint of 0-15 range)
+# Target SF for ~192kbps quality (LAME uses ~4-6 for good bands)
+# Lower = better quality, higher = more compression
+TARGET_SCALEFACTOR = 5.5  # Was 7.5, reduced for better quality target
 
 # =============================================================================
 # MP3 Configuration
