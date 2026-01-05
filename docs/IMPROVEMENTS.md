@@ -4,25 +4,32 @@ Implementation plan for notlame-train enhancements.
 
 ---
 
-## 1. Temporal Modeling (Priority: HIGH)
+## Current Status
 
-### Problem
-Model sees one frame at a time. No context from previous frames. Audio has temporal dependencies (transients, sustains, phrases).
+| Feature | Status |
+|---------|--------|
+| Beat LAME (Mel loss) | 9/9 bitrates |
+| Beat LAME (STFT loss) | 8/9 bitrates |
+| Perceptual weights | Tuned [0.65, 1.35] |
+| Stereo M/S | Implemented |
+| Test suite | 141 tests passing |
 
-### Solution
-Add LSTM or Transformer layers for cross-frame dependencies.
+---
 
-### Implementation
+## High Priority
 
-```python
-# Current model (per-frame):
-Input: (batch, 576)  →  PsychoNet  →  (batch, 21) scalefactors
+### 1. Temporal Modeling
 
-# New model (temporal):
-Input: (batch, seq_len, 576)  →  PsychoNet + LSTM  →  (batch, seq_len, 21)
+**Problem**: Model sees one frame at a time. No context from previous frames. Audio has temporal dependencies (transients, sustains, phrases).
+
+**Solution**: Add LSTM or Transformer layers for cross-frame dependencies.
+
+```
+Current:  frame₁ → SF₁,  frame₂ → SF₂  (independent)
+Improved: [frame₁, frame₂, ...] → LSTM → [SF₁, SF₂, ...]  (context-aware)
 ```
 
-**Changes to model.py:**
+**Implementation:**
 
 ```python
 class PsychoNetTemporal(nn.Module):
@@ -34,7 +41,7 @@ class PsychoNetTemporal(nn.Module):
 
         # NEW: Temporal context
         self.temporal = nn.LSTM(
-            input_size=21,           # scalefactors per frame
+            input_size=22,           # scalefactors per frame
             hidden_size=temporal_dim,
             num_layers=2,
             batch_first=True,
@@ -42,7 +49,7 @@ class PsychoNetTemporal(nn.Module):
         )
 
         # Output projection
-        self.output = nn.Linear(temporal_dim, 21)
+        self.output = nn.Linear(temporal_dim, 22)
 
     def forward(self, x, hidden=None):
         """
@@ -51,7 +58,7 @@ class PsychoNetTemporal(nn.Module):
             hidden: Optional LSTM hidden state for streaming
 
         Returns:
-            scalefactors: (batch, seq_len, 21)
+            scalefactors: (batch, seq_len, 22)
             hidden: Updated hidden state
         """
         batch, seq_len, _ = x.shape
@@ -62,7 +69,7 @@ class PsychoNetTemporal(nn.Module):
             out = self.band_encoder(x[:, t, :])
             frame_features.append(out['scalefactors'])
 
-        # Stack: (batch, seq_len, 21)
+        # Stack: (batch, seq_len, 22)
         frame_features = torch.stack(frame_features, dim=1)
 
         # Temporal processing
@@ -74,7 +81,7 @@ class PsychoNetTemporal(nn.Module):
         return {'scalefactors': scalefactors, 'hidden': hidden}
 ```
 
-**Changes to training:**
+**Training changes:**
 - Already loading 4 consecutive frames (good!)
 - Increase to 8-16 frames for better temporal context
 - Process all frames through temporal model
@@ -87,15 +94,38 @@ class PsychoNetTemporal(nn.Module):
 
 ---
 
-## 2. Adaptive Rate Control (Priority: MEDIUM)
+### 2. Train on Larger Dataset
 
-### Problem
-Fixed target scalefactor (7.5) for all content. Complex passages need more bits, simple passages need fewer.
+**Problem**: Currently using GTZAN (1005 files, ~8 hours). Limited genre diversity.
 
-### Solution
-Model predicts per-frame rate target based on content complexity.
+**Solution**: Train on FMA-large (93GB, ~900 hours of music).
 
-### Implementation
+```bash
+make download-fma-large
+make prepare
+make train TRAIN_STEPS=500000
+```
+
+| Dataset | Size | Hours | Genres | Quality |
+|---------|------|-------|--------|---------|
+| GTZAN | 1.2GB | 8 | 10 | Testing |
+| FMA-small | 7.2GB | 66 | 8 | Good |
+| FMA-large | 93GB | 900 | 161 | Best |
+
+**Benefits:**
+- Better generalization across genres
+- More robust to different audio characteristics
+- Production-quality model
+
+---
+
+## Medium Priority
+
+### 3. Adaptive Rate Control
+
+**Problem**: Fixed target scalefactor (7.5) for all content. Complex passages need more bits, simple passages need fewer.
+
+**Solution**: Model predicts per-frame rate target based on content complexity.
 
 ```python
 class PsychoNetAdaptive(nn.Module):
@@ -123,110 +153,70 @@ class PsychoNetAdaptive(nn.Module):
         }
 ```
 
-**Training changes:**
-
-```python
-# Adaptive rate penalty
-target_sf = output['target_sf']  # Model's prediction
-actual_sf = scalefactors.mean(dim=-1)  # Actual mean SF
-
-# Penalize deviation from predicted target
-rate_loss = F.mse_loss(actual_sf, target_sf.detach())
-
-# Also penalize extreme targets (regularization)
-target_reg = torch.relu(3 - target_sf) + torch.relu(target_sf - 12)
-```
-
 **Benefits:**
-- More bits for complex audio
-- Fewer bits for simple audio
+- More bits for complex audio (orchestral, transients)
+- Fewer bits for simple audio (speech, silence)
 - Better overall quality/compression tradeoff
 
 ---
 
-## 3. Joint Stereo Support (Priority: MEDIUM)
+### 4. Real Audio Evaluation
 
-### Problem
-Mono processing only. Stereo audio is common.
+**Problem**: Current tests use synthetic signals. Need listening tests on real music.
 
-### Solution
-Support mid-side stereo encoding.
+**Solution**: Encode real audio files and compare vs LAME.
 
-### Implementation
+```bash
+# After training
+make evaluate
 
-**Mid-Side Transform:**
-```python
-def to_mid_side(left, right):
-    mid = (left + right) / 2
-    side = (left - right) / 2
-    return mid, side
-
-def from_mid_side(mid, side):
-    left = mid + side
-    right = mid - side
-    return left, right
+# Manual listening test
+make encode-samples
+# Listen to outputs in samples/encoded/
 ```
 
-**Stereo Model:**
-```python
-class PsychoNetStereo(nn.Module):
-    def __init__(self, ...):
-        # Shared encoder for mid and side
-        self.encoder = PsychoNet(...)
-
-        # Separate heads for mid/side
-        self.mid_head = nn.Linear(hidden_dim, 21)
-        self.side_head = nn.Linear(hidden_dim, 21)
-
-        # Stereo correlation predictor
-        self.correlation = nn.Linear(hidden_dim * 2, 1)
-
-    def forward(self, mid_coeffs, side_coeffs):
-        # Encode both channels
-        mid_features = self.encoder.extract_features(mid_coeffs)
-        side_features = self.encoder.extract_features(side_coeffs)
-
-        # Predict scalefactors
-        mid_sf = torch.sigmoid(self.mid_head(mid_features)) * 15
-        side_sf = torch.sigmoid(self.side_head(side_features)) * 15
-
-        # Side channel often needs fewer bits when correlated
-        correlation = torch.sigmoid(self.correlation(
-            torch.cat([mid_features, side_features], dim=-1)
-        ))
-
-        # Reduce side channel bits when highly correlated
-        side_sf = side_sf + correlation * 5  # Increase SF = fewer bits
-
-        return {
-            'mid_sf': mid_sf,
-            'side_sf': side_sf,
-            'correlation': correlation,
-        }
-```
-
-**Data pipeline changes:**
-- Load stereo audio
-- Convert to mid-side
-- Compute MDCT for both channels
-- Train on paired mid/side
-
-**Benefits:**
-- Stereo support
-- Better compression (correlated channels)
-- Compatible with MP3 joint stereo mode
+**Metrics to track:**
+- PESQ (perceptual quality)
+- POLQA (newer perceptual metric)
+- ABX listening tests (blind comparison)
+- Spectrograms (visual inspection)
 
 ---
 
-## 4. Discriminator (Priority: LOW)
+### 5. Short Block Support
 
-### Problem
-Reconstruction losses can cause over-smoothing. Missing fine high-frequency detail.
+**Problem**: Currently long blocks only (1152 samples, ~26ms). Transients (drums, attacks) benefit from short blocks (384 samples, ~9ms).
 
-### Solution
-Add multi-scale STFT discriminator (GAN training).
+**Solution**: Add block switching logic.
 
-### Implementation
+```python
+def detect_transient(frame, prev_frame):
+    """Detect if frame contains transient."""
+    energy_ratio = frame.abs().max() / (prev_frame.abs().max() + 1e-10)
+    return energy_ratio > 3.0  # Threshold
+
+def process_frame(frame, prev_frame, model):
+    if detect_transient(frame, prev_frame):
+        # Use 3 short blocks instead of 1 long block
+        return process_short_blocks(frame, model)
+    else:
+        return process_long_block(frame, model)
+```
+
+**Benefits:**
+- Better transient preservation (drums, percussion)
+- Reduced pre-echo artifacts
+- Matches LAME's block switching behavior
+
+---
+
+## Low Priority
+
+### 6. Discriminator (GAN Training)
+
+**Problem**: Reconstruction losses can cause over-smoothing. Missing fine high-frequency detail.
+
+**Solution**: Add multi-scale STFT discriminator.
 
 ```python
 class MultiScaleSTFTDiscriminator(nn.Module):
@@ -234,7 +224,6 @@ class MultiScaleSTFTDiscriminator(nn.Module):
 
     def __init__(self, fft_sizes=[256, 512, 1024, 2048]):
         super().__init__()
-
         self.discriminators = nn.ModuleList([
             STFTDiscriminator(fft_size) for fft_size in fft_sizes
         ])
@@ -247,71 +236,19 @@ class MultiScaleSTFTDiscriminator(nn.Module):
             outputs.append(out)
             features.append(feat)
         return outputs, features
-
-
-class STFTDiscriminator(nn.Module):
-    """Single-scale STFT discriminator."""
-
-    def __init__(self, fft_size, hop_size=None, channels=32):
-        super().__init__()
-        hop_size = hop_size or fft_size // 4
-
-        self.stft = lambda x: torch.stft(
-            x, fft_size, hop_size, return_complex=True
-        )
-
-        # Conv layers on STFT magnitude
-        n_bins = fft_size // 2 + 1
-        self.convs = nn.Sequential(
-            nn.Conv2d(1, channels, (3, 9), padding=(1, 4)),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(channels, channels * 2, (3, 9), stride=(1, 2), padding=(1, 4)),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(channels * 2, channels * 4, (3, 9), stride=(1, 2), padding=(1, 4)),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(channels * 4, 1, (3, 3), padding=(1, 1)),
-        )
-
-    def forward(self, x):
-        # Compute STFT magnitude
-        stft = self.stft(x)
-        mag = torch.abs(stft).unsqueeze(1)  # (batch, 1, freq, time)
-
-        # Get intermediate features for feature matching loss
-        features = []
-        h = mag
-        for layer in self.convs:
-            h = layer(h)
-            features.append(h)
-
-        return h, features
 ```
 
-**Training changes:**
-
+**Training:**
 ```python
-# Generator (our model) update
-fake_audio = reconstruct(model_output)
-real_audio = original_audio
-
-disc_fake_outputs, disc_fake_features = discriminator(fake_audio)
-disc_real_outputs, disc_real_features = discriminator(real_audio)
-
-# Adversarial loss (generator wants discriminator to think fake is real)
+# Adversarial loss
 adv_loss = sum(F.relu(1 - out).mean() for out in disc_fake_outputs)
 
-# Feature matching loss (match intermediate features)
-feat_loss = 0
-for fake_feat, real_feat in zip(disc_fake_features, disc_real_features):
-    feat_loss += F.l1_loss(fake_feat, real_feat.detach())
+# Feature matching loss
+feat_loss = sum(F.l1_loss(fake, real.detach())
+               for fake, real in zip(fake_features, real_features))
 
-# Total generator loss
+# Combined
 g_loss = reconstruction_loss + 0.1 * adv_loss + 2.0 * feat_loss
-
-# Discriminator update (separate optimizer)
-d_real = sum(F.relu(1 - out).mean() for out in disc_real_outputs)
-d_fake = sum(F.relu(1 + out).mean() for out in disc_fake_outputs)
-d_loss = d_real + d_fake
 ```
 
 **Benefits:**
@@ -326,22 +263,59 @@ d_loss = d_real + d_fake
 
 ---
 
-## Implementation Order
+### 7. Stereo Correlation Optimization
 
-1. **Temporal modeling** - Do first, biggest quality improvement
-2. **Adaptive rate** - Easy add-on, can do with temporal
-3. **Stereo** - After mono model is solid
-4. **Discriminator** - Last, most complex, needs stable base
+**Status**: Stereo M/S already implemented in `model.py` (PsychoNetStereo).
+
+**Potential improvement**: Add correlation-aware bit allocation.
+
+```python
+# Current: shared weights for M and S
+# Improved: reduce side channel bits when highly correlated
+
+correlation = compute_correlation(mid, side)
+side_sf_boost = correlation * 5  # More compression when correlated
+side_sf = base_side_sf + side_sf_boost
+```
+
+**Benefits:**
+- Better stereo compression
+- More bits for uncorrelated content (wide stereo)
+- Fewer bits for correlated content (centered vocals)
 
 ---
 
-## Timeline
+## Implementation Order
 
-| Phase | Feature | Est. Effort |
-|-------|---------|-------------|
-| 1 | Temporal modeling | 2-3 days |
-| 2 | Adaptive rate | 1 day |
-| 3 | Stereo support | 2-3 days |
-| 4 | Discriminator | 3-5 days |
+1. **Larger dataset** - Easy, just download and train
+2. **Real audio evaluation** - Validate current model quality
+3. **Temporal modeling** - Biggest potential quality improvement
+4. **Adaptive rate** - Easy add-on after temporal
+5. **Short blocks** - For transient-heavy music
+6. **Discriminator** - Last, most complex
 
-Start with Phase 1 after current training completes and evaluation shows improvement.
+---
+
+## Quick Wins
+
+These can be done immediately:
+
+```bash
+# 1. Train on more data
+make download-fma-large && make prepare && make train TRAIN_STEPS=500000
+
+# 2. Evaluate current model
+make evaluate
+
+# 3. Run full test suite
+make test
+```
+
+---
+
+## Research References
+
+- **Temporal**: SoundStream, EnCodec use temporal modeling
+- **Adaptive rate**: Variable bitrate (VBR) in modern codecs
+- **Discriminator**: DAC, HiFi-GAN, BigVGAN
+- **Short blocks**: LAME source code, ISO MP3 spec

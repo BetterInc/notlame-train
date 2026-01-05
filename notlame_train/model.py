@@ -182,10 +182,10 @@ class PsychoNet(nn.Module):
 
         Returns:
             dict with:
-                - scalefactors: (batch, 21) values in [0, 15]
+                - scalefactors: (batch, NUM_BANDS) values in [0, 15]
         """
         # Extract band-wise features
-        band_features = self.extract_band_features(x)  # (B, 21, H)
+        band_features = self.extract_band_features(x)  # (B, NUM_BANDS, H)
 
         # Add global context
         global_ctx = self.global_encoder(x)  # (B, H)
@@ -202,7 +202,7 @@ class PsychoNet(nn.Module):
             band_features = band_features + ffn_out
 
         # Output scalefactors
-        scalefactors = self.scalefactor_head(band_features).squeeze(-1)  # (B, 21)
+        scalefactors = self.scalefactor_head(band_features).squeeze(-1)  # (B, NUM_BANDS)
 
         # Constrain scalefactors to valid MP3 range [0, 15]
         # MP3 quantization: step = 2^(sf/4)
@@ -221,7 +221,7 @@ class PsychoNet(nn.Module):
             x: (batch, 576) MDCT coefficients
 
         Returns:
-            (batch, 21) scalefactors
+            (batch, NUM_BANDS) scalefactors
         """
         out = self.forward(x)
         return out["scalefactors"]
@@ -260,15 +260,73 @@ class PsychoNetLite(nn.Module):
         batch_size = x.shape[0]
 
         # Aggregate to band features
-        features = self.band_agg(x)  # (B, H * 21)
-        features = features.view(batch_size, self.num_bands, -1)  # (B, 21, H)
+        features = self.band_agg(x)  # (B, H * NUM_BANDS)
+        features = features.view(batch_size, self.num_bands, -1)  # (B, NUM_BANDS, H)
 
         # Process each band
         features = self.band_net(features)
 
         # Output scalefactors
-        scalefactors = self.output(features).squeeze(-1)  # (B, 21)
+        scalefactors = self.output(features).squeeze(-1)  # (B, NUM_BANDS)
         scalefactors = torch.sigmoid(scalefactors) * 15
+
+        return {
+            "scalefactors": scalefactors,
+        }
+
+
+class PsychoNetStereo(nn.Module):
+    """Stereo wrapper for PsychoNet.
+
+    Processes Mid and Side channels through shared weights.
+    Optionally uses separate side channel processing for better compression
+    (side channel often needs fewer bits when channels are correlated).
+
+    Input: (batch, 2, 576) - Mid and Side MDCT coefficients
+    Output: (batch, 2, 22) scalefactors for M and S channels
+    """
+
+    def __init__(self, base_model: nn.Module, shared_weights: bool = True):
+        super().__init__()
+
+        self.shared_weights = shared_weights
+        self.mid_model = base_model
+
+        if not shared_weights:
+            # Separate model for side channel (can learn different allocation)
+            # Side channel often has less energy and can use coarser quantization
+            import copy
+            self.side_model = copy.deepcopy(base_model)
+        else:
+            self.side_model = base_model
+
+    def forward(self, x: torch.Tensor) -> dict:
+        """Process stereo MDCT coefficients.
+
+        Args:
+            x: (batch, 2, 576) Mid and Side MDCT coefficients
+               or (batch, 576) mono coefficients
+
+        Returns:
+            dict with 'scalefactors': (batch, 2, 22) or (batch, 22) for mono
+        """
+        # Handle mono input
+        if x.dim() == 2:
+            return self.mid_model(x)
+
+        # Split Mid and Side
+        mid = x[:, 0, :]  # (batch, 576)
+        side = x[:, 1, :]  # (batch, 576)
+
+        # Process each channel
+        mid_out = self.mid_model(mid)
+        side_out = self.side_model(side)
+
+        # Stack results
+        mid_sf = mid_out["scalefactors"]  # (batch, 22)
+        side_sf = side_out["scalefactors"]  # (batch, 22)
+
+        scalefactors = torch.stack([mid_sf, side_sf], dim=1)  # (batch, 2, 22)
 
         return {
             "scalefactors": scalefactors,
@@ -280,36 +338,24 @@ def count_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def create_model(variant: str = "default", **kwargs) -> nn.Module:
+def create_model(variant: str = "default", stereo: bool = False, **kwargs) -> nn.Module:
     """Create a PsychoNet model.
 
     Args:
-        variant: "default", "lite", or "large"
+        variant: "default", "lite", "large", or "stereo"
+        stereo: Wrap model for stereo processing
         **kwargs: Additional arguments for the model
 
     Returns:
-        PsychoNet model
+        PsychoNet model (or PsychoNetStereo if stereo=True)
     """
     if variant == "lite":
-        return PsychoNetLite(**kwargs)
+        base = PsychoNetLite(**kwargs)
     elif variant == "large":
-        return PsychoNet(hidden_dim=128, num_layers=4, **kwargs)
+        base = PsychoNet(hidden_dim=128, num_layers=4, **kwargs)
     else:
-        return PsychoNet(**kwargs)
+        base = PsychoNet(**kwargs)
 
-
-if __name__ == "__main__":
-    # Test models
-    print("Testing PsychoNet models...")
-
-    batch_size = 4
-    x = torch.randn(batch_size, 576)
-
-    for variant in ["default", "lite", "large"]:
-        model = create_model(variant)
-        out = model(x)
-
-        print(f"\n{variant}:")
-        print(f"  Parameters: {count_parameters(model):,}")
-        print(f"  Scalefactors shape: {out['scalefactors'].shape}")
-        print(f"  Scalefactors range: [{out['scalefactors'].min():.2f}, {out['scalefactors'].max():.2f}]")
+    if stereo:
+        return PsychoNetStereo(base, shared_weights=True)
+    return base

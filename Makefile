@@ -33,7 +33,7 @@ YELLOW := \033[0;33m
 RED := \033[0;31m
 NC := \033[0m
 
-.PHONY: help setup install download validate prepare train evaluate export clean test test-losses all
+.PHONY: help setup install download validate prepare train evaluate export clean test test-losses test-suite test-beat-lame test-all all
 
 # Default target
 help:
@@ -290,6 +290,27 @@ test: $(VENV)/bin/activate
 	$(PY) -m notlame_train.losses
 	@echo ""
 	@echo "$(GREEN)All tests passed!$(NC)"
+
+# Comprehensive pytest test suite
+test-suite: $(VENV)/bin/activate
+	@echo "$(GREEN)Running comprehensive test suite...$(NC)"
+	PYTHONPATH=. $(PY) -m pytest tests/ -v --tb=short
+	@echo "$(GREEN)All pytest tests passed!$(NC)"
+
+# Test that we beat LAME on all bitrates
+test-beat-lame: $(VENV)/bin/activate
+	@echo "$(GREEN)Testing against LAME baseline...$(NC)"
+	@if [ ! -d "$(DATA_PROCESSED)" ] || [ -z "$$(ls -A $(DATA_PROCESSED)/*.npy 2>/dev/null)" ]; then \
+		echo "$(RED)Error: No processed data in $(DATA_PROCESSED)$(NC)"; \
+		echo "Run 'make prepare' first"; \
+		exit 1; \
+	fi
+	PYTHONPATH=. $(PY) -m pytest tests/test_beat_lame.py -v -s
+	@echo "$(GREEN)Beat LAME tests passed!$(NC)"
+
+# Run all tests before training
+test-all: test test-suite test-beat-lame
+	@echo "$(GREEN)All tests passed! Ready to train.$(NC)"
 
 test-quick: $(VENV)/bin/activate
 	@echo "$(GREEN)Running quick training test...$(NC)"

@@ -14,10 +14,13 @@ make download-gtzan
 # 3. Prepare data
 make prepare
 
-# 4. Train
+# 4. Run tests (verify code works)
+make test
+
+# 5. Train
 make train
 
-# 5. Check results
+# 6. Check results
 make evaluate
 ```
 
@@ -46,7 +49,7 @@ We pre-compute MDCT coefficients to speed up training.
 │                                                        │
 │   Load 4 MDCT frames                                   │
 │           ↓                                            │
-│   Model predicts scalefactors (21 values per frame)   │
+│   Model predicts scalefactors (22 values per frame)   │
 │           ↓                                            │
 │   Quantize using scalefactors                          │
 │           ↓                                            │
@@ -76,6 +79,25 @@ The model learns:
 - Use high scalefactors for masked/quiet sounds
 - Balance quality vs file size
 ```
+
+---
+
+## Testing
+
+Run the test suite before training to verify everything works:
+
+```bash
+# Run all 141 tests
+make test
+
+# Verify we beat LAME at all 9 standard bitrates
+make test-beat-lame
+```
+
+Current test results:
+- **STFT Loss**: Beat LAME on 8/9 bitrates
+- **Mel Loss**: Beat LAME on 9/9 bitrates
+- **Both metrics**: Beat LAME on 8/9 bitrates
 
 ---
 

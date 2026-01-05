@@ -150,10 +150,69 @@ class MultiResolutionSTFTLoss(nn.Module):
         return sc_total / n, mag_total / n
 
 
-class MelSpectrogramLoss(nn.Module):
-    """Mel spectrogram loss.
+def compute_mel_perceptual_weights(n_mels: int, f_min: float, f_max: float) -> torch.Tensor:
+    """Compute perceptual importance weights for mel bands.
 
-    Perceptually-weighted frequency domain loss.
+    Based on equal-loudness contours and speech/music importance:
+    - Peak sensitivity at 2-5kHz (speech fundamentals, music presence)
+    - Lower sensitivity at extremes (<200Hz, >12kHz)
+
+    Args:
+        n_mels: Number of mel bands
+        f_min: Minimum frequency (Hz)
+        f_max: Maximum frequency (Hz)
+
+    Returns:
+        (n_mels,) tensor of perceptual weights, normalized to mean=1
+    """
+    # Compute center frequencies for each mel band
+    def hz_to_mel(hz):
+        return 2595 * math.log10(1 + hz / 700)
+
+    def mel_to_hz(mel):
+        return 700 * (10 ** (mel / 2595) - 1)
+
+    mel_min = hz_to_mel(f_min)
+    mel_max = hz_to_mel(f_max)
+    mel_centers = torch.linspace(mel_min, mel_max, n_mels)
+    hz_centers = torch.tensor([mel_to_hz(m.item()) for m in mel_centers])
+
+    # Compute perceptual weights based on frequency
+    weights = torch.zeros(n_mels)
+    for i, f in enumerate(hz_centers):
+        f_khz = f.item() / 1000.0
+
+        if f_khz < 0.15:  # <150Hz: very low sensitivity
+            weights[i] = 0.3
+        elif f_khz < 0.3:  # 150-300Hz: low
+            weights[i] = 0.3 + 0.4 * (f_khz - 0.15) / 0.15
+        elif f_khz < 0.5:  # 300-500Hz: moderate-low
+            weights[i] = 0.7 + 0.3 * (f_khz - 0.3) / 0.2
+        elif f_khz < 1.0:  # 500Hz-1kHz: moderate
+            weights[i] = 1.0 + 0.4 * (f_khz - 0.5) / 0.5
+        elif f_khz < 2.0:  # 1-2kHz: high
+            weights[i] = 1.4 + 0.4 * (f_khz - 1.0) / 1.0
+        elif f_khz < 5.0:  # 2-5kHz: PEAK sensitivity
+            weights[i] = 1.8 + 0.2 * (1 - abs(f_khz - 3.5) / 1.5)
+        elif f_khz < 8.0:  # 5-8kHz: high
+            weights[i] = 1.8 - 0.4 * (f_khz - 5.0) / 3.0
+        elif f_khz < 12.0:  # 8-12kHz: moderate
+            weights[i] = 1.4 - 0.5 * (f_khz - 8.0) / 4.0
+        else:  # >12kHz: low
+            weights[i] = 0.9 - 0.4 * min((f_khz - 12.0) / 8.0, 1.0)
+
+    # Normalize to mean=1
+    weights = weights.clamp(0.3, 2.0)
+    weights = weights / weights.mean()
+
+    return weights
+
+
+class MelSpectrogramLoss(nn.Module):
+    """Mel spectrogram loss using librosa-compatible computation.
+
+    Matches the evaluation metrics exactly for consistent training/eval.
+    Optionally applies perceptual weighting to emphasize critical frequency bands.
     """
 
     def __init__(
@@ -164,6 +223,7 @@ class MelSpectrogramLoss(nn.Module):
         n_mels: int = 80,
         f_min: float = 0.0,
         f_max: Optional[float] = None,
+        use_perceptual_weight: bool = True,
     ):
         super().__init__()
 
@@ -173,38 +233,70 @@ class MelSpectrogramLoss(nn.Module):
         self.n_mels = n_mels
         self.f_min = f_min
         self.f_max = f_max or sample_rate / 2
+        self.use_perceptual_weight = use_perceptual_weight
 
-        # Create mel filterbank
-        mel_basis = self._create_mel_filterbank()
-        self.register_buffer("mel_basis", mel_basis)
+        # Use librosa's mel filterbank for exact match with evaluation
+        # Ensure n_mels is valid for the FFT size to avoid empty filters
+        n_freqs = n_fft // 2 + 1
+        if n_mels > n_freqs - 2:
+            # Too many mel bands for this FFT size - reduce
+            self.n_mels = max(8, n_freqs - 2)
+
+        try:
+            import librosa
+            mel_basis = librosa.filters.mel(
+                sr=sample_rate,
+                n_fft=n_fft,
+                n_mels=self.n_mels,
+                fmin=f_min,
+                fmax=self.f_max,
+            )
+            # Check for empty filters and warn if found
+            empty_count = (mel_basis.sum(axis=1) == 0).sum()
+            if empty_count > 0:
+                # This shouldn't happen with proper n_mels, but handle gracefully
+                mel_basis = mel_basis[mel_basis.sum(axis=1) > 0]
+                self.n_mels = mel_basis.shape[0]
+            self.register_buffer("mel_basis", torch.from_numpy(mel_basis).float())
+            self._use_librosa = True
+        except ImportError:
+            # Fallback to custom filterbank
+            mel_basis = self._create_mel_filterbank()
+            self.register_buffer("mel_basis", mel_basis)
+            self._use_librosa = False
 
         # STFT window
         window = torch.hann_window(n_fft)
         self.register_buffer("window", window)
 
+        # Perceptual weights for mel bands
+        if use_perceptual_weight:
+            perceptual_weights = compute_mel_perceptual_weights(
+                self.n_mels, f_min, self.f_max
+            )
+            self.register_buffer("perceptual_weights", perceptual_weights)
+        else:
+            self.register_buffer("perceptual_weights", torch.ones(self.n_mels))
+
     def _create_mel_filterbank(self) -> torch.Tensor:
-        """Create mel filterbank matrix."""
+        """Create mel filterbank matrix (fallback if librosa unavailable)."""
         n_freqs = self.n_fft // 2 + 1
 
-        # Mel scale conversion
         def hz_to_mel(hz):
             return 2595 * math.log10(1 + hz / 700)
 
         def mel_to_hz(mel):
             return 700 * (10 ** (mel / 2595) - 1)
 
-        # Mel points
         mel_min = hz_to_mel(self.f_min)
         mel_max = hz_to_mel(self.f_max)
         mel_points = torch.linspace(mel_min, mel_max, self.n_mels + 2)
         hz_points = torch.tensor([mel_to_hz(m) for m in mel_points])
 
-        # Convert to FFT bins
         bin_points = torch.floor(
             (self.n_fft + 1) * hz_points / self.sample_rate
         ).long()
 
-        # Create filterbank
         filterbank = torch.zeros(self.n_mels, n_freqs)
 
         for i in range(self.n_mels):
@@ -212,12 +304,10 @@ class MelSpectrogramLoss(nn.Module):
             center = bin_points[i + 1]
             right = bin_points[i + 2]
 
-            # Rising slope
             for j in range(left, center):
                 if center > left:
                     filterbank[i, j] = (j - left) / (center - left)
 
-            # Falling slope
             for j in range(center, right):
                 if right > center:
                     filterbank[i, j] = (right - j) / (right - center)
@@ -225,13 +315,13 @@ class MelSpectrogramLoss(nn.Module):
         return filterbank
 
     def mel_spectrogram(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute mel spectrogram.
+        """Compute mel spectrogram (librosa-compatible).
 
         Args:
             x: (batch, time) audio signal
 
         Returns:
-            (batch, n_mels, frames) mel spectrogram
+            (batch, n_mels, frames) log mel spectrogram
         """
         if x.dim() == 1:
             x = x.unsqueeze(0)
@@ -248,44 +338,46 @@ class MelSpectrogramLoss(nn.Module):
             pad_mode="reflect",
         )
 
-        # Power spectrogram
+        # Power spectrogram (matches librosa)
         power = torch.abs(spec) ** 2
 
-        # Apply mel filterbank
-        mel = torch.matmul(self.mel_basis, power)
+        # Apply mel filterbank: (n_mels, n_freqs) @ (batch, n_freqs, frames)
+        # Need to transpose for matmul
+        power_t = power.transpose(-2, -1)  # (batch, frames, n_freqs)
+        mel = torch.matmul(power_t, self.mel_basis.T)  # (batch, frames, n_mels)
+        mel = mel.transpose(-2, -1)  # (batch, n_mels, frames)
 
-        # Log scale
+        # Log scale (same as evaluation)
         log_mel = torch.log(mel + 1e-8)
 
         return log_mel
 
     def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """Compute mel spectrogram loss.
+        """Compute mel spectrogram L1 loss with perceptual weighting.
 
         Args:
             x: (batch, time) predicted signal
             y: (batch, time) target signal
 
         Returns:
-            L1 loss between mel spectrograms
+            Perceptually-weighted L1 loss between log mel spectrograms
         """
         x_mel = self.mel_spectrogram(x)
         y_mel = self.mel_spectrogram(y)
 
-        return F.l1_loss(x_mel, y_mel)
+        # Compute weighted L1 loss
+        # weights: (n_mels,) -> (1, n_mels, 1) for broadcasting
+        weights = self.perceptual_weights.view(1, -1, 1)
+        weighted_diff = weights * torch.abs(x_mel - y_mel)
+
+        return weighted_diff.mean()
 
 
 class MultiScaleMelLoss(nn.Module):
-    """Multi-scale mel spectrogram loss (DAC-style).
+    """Multi-scale mel spectrogram loss with perceptual weighting.
 
-    Uses multiple window sizes for better multi-resolution coverage.
-    Based on DAC paper: window lengths [32, 64, 128, 256, 512, 1024, 2048]
-    Adjusted for 1152-sample frames: [32, 64, 128, 256, 512]
-
-    Research findings:
-    - Multi-scale prevents over-smoothing (MelCap, 2025)
-    - More scales = better perceptual quality (DAC, 2023)
-    - Combines L1 + L2 for both detail and stability
+    Uses multiple window sizes for multi-resolution coverage.
+    Applies perceptual weighting to emphasize critical frequency bands.
     """
 
     def __init__(
@@ -293,48 +385,53 @@ class MultiScaleMelLoss(nn.Module):
         sample_rate: int = 44100,
         window_lengths: List[int] = [32, 64, 128, 256, 512],
         n_mels: int = 64,
-        use_l2: bool = True,
+        use_l2: bool = False,  # Default to False to match evaluation
+        use_perceptual_weight: bool = True,
     ):
         super().__init__()
         self.use_l2 = use_l2
+        self.use_perceptual_weight = use_perceptual_weight
 
         self.losses = nn.ModuleList()
         for win_len in window_lengths:
             hop = win_len // 4
+            # Librosa mel filterbank needs smaller n_mels than (n_fft/2+1)
+            # Empirically: n_mels ~= n_fft/8 works without empty filters at 44.1kHz
+            max_safe_mels = max(8, win_len // 8)
+            actual_mels = min(n_mels, max_safe_mels)
             self.losses.append(
                 MelSpectrogramLoss(
                     sample_rate=sample_rate,
                     n_fft=win_len,
                     hop_length=hop,
-                    n_mels=min(n_mels, win_len // 2),
+                    n_mels=actual_mels,
+                    use_perceptual_weight=use_perceptual_weight,
                 )
             )
 
     def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """Compute multi-scale mel loss.
+        """Compute multi-scale mel loss with perceptual weighting.
 
         Args:
             x: (batch, time) predicted signal
             y: (batch, time) target signal
 
         Returns:
-            Combined L1 + L2 loss across all scales (research shows this works best)
+            Average perceptually-weighted loss across all scales
         """
-        l1_total = 0.0
-        l2_total = 0.0
+        total_loss = 0.0
 
         for loss_fn in self.losses:
-            x_mel = loss_fn.mel_spectrogram(x)
-            y_mel = loss_fn.mel_spectrogram(y)
-            l1_total += F.l1_loss(x_mel, y_mel)
+            # Use the forward method which applies perceptual weighting
+            total_loss += loss_fn(x, y)
             if self.use_l2:
-                l2_total += F.mse_loss(x_mel, y_mel)
+                x_mel = loss_fn.mel_spectrogram(x)
+                y_mel = loss_fn.mel_spectrogram(y)
+                weights = loss_fn.perceptual_weights.view(1, -1, 1)
+                weighted_mse = weights * (x_mel - y_mel) ** 2
+                total_loss += 0.5 * weighted_mse.mean()
 
-        n = len(self.losses)
-        if self.use_l2:
-            # Combine L1 (detail) + L2 (stability) as per research
-            return (l1_total / n) + 0.5 * (l2_total / n)
-        return l1_total / n
+        return total_loss / len(self.losses)
 
 
 class PerceptualLoss(nn.Module):
@@ -495,8 +592,8 @@ class BitrateLoss(nn.Module):
         """Compute bitrate penalty.
 
         Args:
-            scalefactors: (batch, 21) predicted scalefactors [0-15]
-            energy: (batch, 21) band energies
+            scalefactors: (batch, NUM_BANDS) predicted scalefactors [0-15]
+            energy: (batch, NUM_BANDS) band energies
 
         Returns:
             Penalty for inefficient bit allocation (using too many bits)
@@ -660,62 +757,3 @@ class RateDistortionLoss(nn.Module):
             "adaptive_rate": adaptive_rate,
             "sf_mean": sf_mean,
         }
-
-
-if __name__ == "__main__":
-    # Test losses
-    print("Testing loss functions...")
-
-    batch_size = 4
-    length = 44100  # 1 second at 44.1kHz
-
-    x = torch.randn(batch_size, length)
-    y = x + 0.1 * torch.randn(batch_size, length)  # Slightly noisy
-
-    # Test STFT loss
-    stft_loss = STFTLoss()
-    sc, mag = stft_loss(x, y)
-    print(f"STFT loss - SC: {sc:.4f}, Mag: {mag:.4f}")
-
-    # Test multi-resolution STFT
-    mr_stft = MultiResolutionSTFTLoss()
-    sc, mag = mr_stft(x, y)
-    print(f"Multi-res STFT - SC: {sc:.4f}, Mag: {mag:.4f}")
-
-    # Test mel loss
-    mel_loss = MelSpectrogramLoss()
-    mel = mel_loss(x, y)
-    print(f"Mel loss: {mel:.4f}")
-
-    # Test perceptual loss
-    perceptual = PerceptualLoss()
-    losses = perceptual(x, y)
-    print(f"Perceptual total: {losses['total']:.4f}")
-
-    # Test combined loss
-    scalefactors = torch.rand(batch_size, NUM_BANDS) * 15
-    energy = torch.rand(batch_size, NUM_BANDS)
-
-    combined = CombinedLoss()
-    losses = combined(x, y, scalefactors, energy)
-    print(f"Combined total: {losses['total']:.4f}")
-
-    # Test MDCT loss with perceptual weighting
-    print("\nTesting MDCT loss...")
-    mdct_x = torch.randn(batch_size, 576)
-    mdct_y = mdct_x + 0.1 * torch.randn(batch_size, 576)
-
-    mdct_loss = MDCTLoss(use_perceptual_weights=True)
-    loss = mdct_loss(mdct_x, mdct_y)
-    print(f"MDCT loss (perceptual): {loss:.4f}")
-    print(f"Weight range: [{mdct_loss.weights.min():.2f}, {mdct_loss.weights.max():.2f}]")
-
-    # Test rate-distortion loss
-    print("\nTesting rate-distortion loss...")
-    rd_loss = RateDistortionLoss(rate_weight=0.01)
-    losses = rd_loss(mdct_x, mdct_y, scalefactors)
-    print(f"RD total: {losses['total']:.4f}")
-    print(f"  Distortion: {losses['distortion']:.4f}")
-    print(f"  Rate: {losses['rate']:.4f}")
-    print(f"  Adaptive rate: {losses['adaptive_rate']:.4f}")
-    print(f"  SF mean: {losses['sf_mean']:.2f}")

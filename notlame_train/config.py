@@ -16,9 +16,10 @@ STFT_WIN_SIZES = [64, 128, 256, 512]
 # Multi-Scale Mel Loss Configuration (DAC-style)
 # =============================================================================
 MEL_SAMPLE_RATE = 44100
-MEL_WINDOW_LENGTHS = [32, 64, 128, 256, 512]
+# Minimum 128 to avoid empty mel filters in librosa
+MEL_WINDOW_LENGTHS = [128, 256, 512]
 MEL_N_MELS = 64
-MEL_USE_L2 = True  # L1 + L2 combination per MelCap research
+MEL_USE_L2 = False  # Pure L1 to match evaluation metrics
 
 # =============================================================================
 # Loss Weights (based on DAC/LRAC research)
