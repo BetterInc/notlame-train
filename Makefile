@@ -22,6 +22,7 @@ DEVICE ?= cuda
 WORKERS ?= 4
 MODEL_VARIANT ?= default
 CACHE ?= 1
+FRAMES ?= 4
 
 # Evaluation config
 BITRATE ?= 192
@@ -126,6 +127,12 @@ download-fma: $(VENV)/bin/activate
 	$(PY) scripts/download_data.py --output $(DATA_RAW) --datasets fma-small
 	@echo "$(GREEN)Download complete!$(NC)"
 
+download-fma-large: $(VENV)/bin/activate
+	@echo "$(GREEN)Downloading FMA-large music dataset (93GB, 879 hours)...$(NC)"
+	@mkdir -p $(DATA_RAW)
+	$(PY) scripts/download_data.py --output $(DATA_RAW) --datasets fma-large
+	@echo "$(GREEN)Download complete!$(NC)"
+
 download-librispeech: $(VENV)/bin/activate
 	@echo "$(GREEN)Downloading LibriSpeech speech dataset (6.3GB)...$(NC)"
 	@mkdir -p $(DATA_RAW)
@@ -195,6 +202,7 @@ train: $(VENV)/bin/activate test-losses
 		--workers $(WORKERS) \
 		--model $(MODEL_VARIANT) \
 		--checkpoint-dir $(CHECKPOINTS) \
+		--frames $(FRAMES) \
 		$(if $(filter 1,$(CACHE)),--cache,)
 	@echo "$(GREEN)Training complete!$(NC)"
 
@@ -213,6 +221,7 @@ train-resume: $(VENV)/bin/activate
 		--workers $(WORKERS) \
 		--model $(MODEL_VARIANT) \
 		--checkpoint-dir $(CHECKPOINTS) \
+		--frames $(FRAMES) \
 		--resume $(CHECKPOINTS)/latest.pt \
 		$(if $(filter 1,$(CACHE)),--cache,)
 	@echo "$(GREEN)Training complete!$(NC)"

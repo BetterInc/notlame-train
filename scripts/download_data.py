@@ -64,6 +64,14 @@ DATASETS = {
         "type": "music",
         "format": "zip",
     },
+    "fma-large": {
+        "url": "https://os.unil.cloud.switch.ch/fma/fma_large.zip",
+        "size_gb": 93.0,
+        "hours": 879,
+        "description": "106574 tracks, 30s each, 161 genres (MP3 320k)",
+        "type": "music",
+        "format": "zip",
+    },
     "gtzan": {
         "url": "https://huggingface.co/datasets/marsyas/gtzan/resolve/main/data/genres.tar.gz",
         "size_gb": 1.2,
