@@ -356,6 +356,3 @@ We present a training methodology for neural MP3 scalefactor prediction that com
 7. "Baseline Systems for the 2025 Low-Resource Audio Codec Challenge." arXiv:2510.00264, 2025.
 8. "MelCap: A Unified Single-Codebook Neural Codec." arXiv:2510.01903, 2025.
 
----
-
-*Document generated from notlame-train research, January 2026*
