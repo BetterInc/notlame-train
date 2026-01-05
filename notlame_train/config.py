@@ -38,11 +38,9 @@ TARGET_SCALEFACTOR = 7.5  # Target average SF (midpoint of 0-15 range)
 # =============================================================================
 # MP3 Configuration
 # =============================================================================
-MP3_FRAME_SIZE = 1152     # Samples per MP3 frame
-MP3_COEFFS = 576          # MDCT coefficients per frame
-MP3_BANDS = 21            # Number of scalefactor bands
-MP3_SF_RANGE = (0, 15)    # Scalefactor range
-AUDIO_SCALE = 100.0       # Scaling for quantization impact
+# All MP3 structure constants (FRAME_SIZE, MDCT_SIZE, NUM_BANDS, etc.)
+# are in model.py - import from there to avoid duplication
+SF_RANGE = (0, 15)        # Scalefactor range
 
 # =============================================================================
 # Training Configuration

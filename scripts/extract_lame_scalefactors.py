@@ -8,12 +8,17 @@ Much easier than learning from scratch!
 import argparse
 import subprocess
 import struct
+import sys
 import numpy as np
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 import tempfile
 import soundfile as sf
 from tqdm import tqdm
+
+# Add parent to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from notlame_train.model import SCALEFACTOR_BANDS_LONG, NUM_BANDS
 
 
 def decode_mp3_frame_header(data: bytes, offset: int) -> Optional[dict]:
@@ -87,8 +92,6 @@ def create_lame_training_data(
     This gives us target scalefactors that achieve LAME-like quality.
     """
     import torch
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent.parent))
     from notlame_train.differentiable_mp3 import DifferentiableMDCT
 
     output_dir = Path(output_dir)
@@ -107,10 +110,6 @@ def create_lame_training_data(
     print(f"Processing {len(audio_files)} files...")
 
     mdct = DifferentiableMDCT()
-
-    # Scalefactor band boundaries
-    BAND_BOUNDS = [0, 4, 8, 12, 16, 20, 24, 30, 36, 44, 52, 62, 74, 90, 110, 134, 162, 196, 238, 288, 342, 418, 576]
-
     total_frames = 0
     saved_files = 0
 
@@ -167,7 +166,6 @@ def create_lame_training_data(
                 hop_size = 576
 
                 mdct_original = []
-                mdct_decoded = []
                 target_scalefactors = []
 
                 for i in range(0, len(audio) - frame_size, hop_size):
@@ -179,8 +177,8 @@ def create_lame_training_data(
 
                     # Compute per-band error
                     band_errors = []
-                    for b in range(21):
-                        start, end = BAND_BOUNDS[b], BAND_BOUNDS[b+1]
+                    for b in range(NUM_BANDS):
+                        start, end = SCALEFACTOR_BANDS_LONG[b], SCALEFACTOR_BANDS_LONG[b+1]
                         orig_band = orig_coeffs[start:end]
                         dec_band = dec_coeffs[start:end]
 

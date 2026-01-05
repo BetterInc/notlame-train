@@ -5,7 +5,7 @@ Uses straight-through estimators and soft quantization.
 """
 
 import math
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -37,8 +37,6 @@ class DifferentiableMDCT(nn.Module):
         M = self.n_coeffs
         n = torch.arange(N, dtype=torch.float32)
         k = torch.arange(M, dtype=torch.float32)
-
-        n0 = (N + 1) / 2  # Standard MDCT offset
 
         # MDCT cosine basis: cos(π/N * (2n + 1 + N/2) * (2k + 1) / 2)
         # Simplified: cos(π/M * (n + n0) * (k + 0.5)) where n0 = (N+1)/2
@@ -145,13 +143,16 @@ class SoftQuantize(nn.Module):
 
 
 class MP3Quantizer(nn.Module):
-    """MP3-style quantization with scalefactors.
+    """Linear quantization with scalefactor-controlled step size.
 
-    Quantizes MDCT coefficients based on scalefactor band allocations.
-    Uses straight-through estimator for differentiability.
+    Uses simple linear quantization which produces much lower spectral
+    distortion (MR-STFT) than the traditional x^0.75 power law formula.
 
-    Note: Input audio is assumed to be normalized [-1, 1]. We scale up
-    internally to match real MP3 coefficient magnitudes (16-bit audio).
+    The scalefactor controls quantization coarseness:
+    - SF=0: finest quantization (best quality, most bits)
+    - SF=15: coarsest quantization (worst quality, fewest bits)
+
+    Step size = base_step * 2^(sf/4), so SF=15 gives ~13x coarser quantization.
     """
 
     def __init__(self, use_soft: bool = False, temperature: float = 1.0):
@@ -159,11 +160,12 @@ class MP3Quantizer(nn.Module):
 
         self.use_soft = use_soft
 
-        # Scale factor to convert normalized audio to MP3-like magnitudes
-        # Lower scale = scalefactors have more impact on quality
-        # With scale=100: SF=0 gives ~47 dB SNR, SF=15 gives ~25 dB SNR
-        # This gives meaningful quality differences for training
-        self.audio_scale = 100.0
+        # Base step size for quantization (at SF=0)
+        # Chosen to give ~8-bit equivalent precision for typical MDCT coefficients
+        # MDCT coeffs of normalized audio typically range [-20, 20]
+        # With base_step=0.15, SF=0 gives fine quantization (~0.15 step)
+        # SF=15 gives coarse quantization (~2.0 step)
+        self.base_step = 0.15
 
         # Band boundaries
         bands = torch.tensor(SCALEFACTOR_BANDS_LONG, dtype=torch.long)
@@ -188,58 +190,38 @@ class MP3Quantizer(nn.Module):
         Returns:
             (batch, 576) quantized coefficients
         """
-        batch_size = coeffs.shape[0]
         quantized = torch.zeros_like(coeffs)
-
-        # Scale up coefficients to MP3-like magnitudes
-        coeffs_scaled = coeffs * self.audio_scale
 
         for i in range(NUM_BANDS):
             start = SCALEFACTOR_BANDS_LONG[i]
             end = SCALEFACTOR_BANDS_LONG[i + 1]
 
-            band_coeffs = coeffs_scaled[:, start:end]
+            band_coeffs = coeffs[:, start:end]
             sf = scalefactors[:, i : i + 1]  # (batch, 1)
 
-            # MP3-style quantization (differentiable approximation):
-            # Forward:  quant = sign(x) * round(|x|^0.75 / step)
-            # Inverse:  x = sign * (quant * step)^(4/3)
-            # where step = 2^(sf / 4)
-            #
-            # This ensures perfect reconstruction (ignoring rounding):
-            # (|x|^0.75 / step * step)^(4/3) = (|x|^0.75)^(4/3) = |x|
-            step = torch.pow(2.0, sf / 4.0)
+            # Step size controlled by scalefactor
+            # SF=0 -> step=base_step, SF=15 -> step=base_step*13.45
+            step = self.base_step * torch.pow(2.0, sf / 4.0)
 
-            # Apply 3/4 power law (non-uniform quantization)
-            sign = torch.sign(band_coeffs)
-            magnitude = torch.abs(band_coeffs)
-
-            # Forward: x^0.75 / step (ISO standard formula)
-            # Add 0.4054 bias for better rounding (reduces small-value error)
-            scaled = torch.pow(magnitude + 1e-10, 0.75) / step
-
-            # Quantize
+            # Linear quantization: round(x / step) * step
             if self.use_soft:
+                scaled = band_coeffs / step
                 quant = self.soft_quantize(scaled)
+                dequant = quant * step
             else:
+                scaled = band_coeffs / step
                 quant = StraightThroughQuantize.apply(scaled)
-
-            # Dequantize: (quant * step)^(4/3)
-            # This is the correct inverse of our forward formula:
-            # Forward:  quant = |x|^0.75 / step
-            # Inverse:  x = (quant * step)^(4/3) = quant^(4/3) * step^(4/3) = |x|
-            dequant = sign * torch.pow(torch.abs(quant * step) + 1e-10, 4.0 / 3.0)
+                dequant = quant * step
 
             # Apply masking threshold if provided
             if thresholds is not None:
-                mask = thresholds[:, i : i + 1] * self.audio_scale
+                mask = thresholds[:, i : i + 1]
                 # Zero out coefficients below threshold
-                dequant = dequant * (magnitude > mask).float()
+                dequant = dequant * (band_coeffs.abs() > mask).float()
 
             quantized[:, start:end] = dequant
 
-        # Scale back down to normalized range
-        return quantized / self.audio_scale
+        return quantized
 
 
 class DifferentiableMP3(nn.Module):
@@ -605,7 +587,7 @@ if __name__ == "__main__":
     if snr > 50:
         print("   ✓ MDCT reconstruction is working correctly!")
     else:
-        print(f"   ✗ WARNING: SNR should be >50 dB for perfect reconstruction")
+        print("   ✗ WARNING: SNR should be >50 dB for perfect reconstruction")
 
     # Test 2: Energy preservation (Parseval's theorem)
     print("\n2. Testing energy preservation:")
@@ -624,7 +606,7 @@ if __name__ == "__main__":
 
     # Test different scalefactor values
     for sf_val in [0, 7, 15]:
-        scalefactors = torch.ones(batch_size, 21) * sf_val
+        scalefactors = torch.ones(batch_size, NUM_BANDS) * sf_val
         mp3 = DifferentiableMP3(frame_size)
         quantized = mp3.quantizer(batch_coeffs, scalefactors)
 
@@ -639,7 +621,7 @@ if __name__ == "__main__":
     # Test 4: Gradient flow
     print("\n4. Testing gradient flow:")
     batch_coeffs = torch.randn(batch_size, 576) * 0.1
-    scalefactors = torch.rand(batch_size, 21) * 15
+    scalefactors = torch.rand(batch_size, NUM_BANDS) * 15
     scalefactors.requires_grad = True
 
     mp3 = DifferentiableMP3(frame_size)

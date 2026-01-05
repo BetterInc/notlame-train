@@ -13,7 +13,7 @@ import torch.onnx
 import onnx
 from onnx import checker
 
-from .model import create_model, count_parameters
+from .model import create_model, count_parameters, NUM_BANDS
 
 
 class PsychoNetONNX(torch.nn.Module):
@@ -21,7 +21,7 @@ class PsychoNetONNX(torch.nn.Module):
 
     Simplifies the interface for inference:
     Input: (batch, 576) MDCT coefficients
-    Output: (batch, 21) scalefactors [0-15]
+    Output: (batch, NUM_BANDS) scalefactors [0-15]
 
     Scalefactor semantics (MP3 standard):
     - Low values (0-5): fine quantization, high quality, more bits
@@ -138,7 +138,7 @@ def export_onnx(
             test_input = dummy_input.numpy()
             outputs = session.run(None, {"input": test_input})
 
-            print(f"  Test inference: OK")
+            print("  Test inference: OK")
             print(f"  Output shape: {outputs[0].shape}")
             print(f"  Output range: [{outputs[0].min():.2f}, {outputs[0].max():.2f}]")
 
@@ -164,11 +164,11 @@ def export_onnx(
     print("\n--- Model Info ---")
     print(f"Variant: {model_variant}")
     print(f"Parameters: {count_parameters(model):,}")
-    print(f"Input: (batch, 576) MDCT coefficients")
-    print(f"Output: (batch, 21) scalefactors")
-    print(f"Scalefactor range: [0, 15]")
-    print(f"  Low SF (0-5): fine quantization, high quality, more bits")
-    print(f"  High SF (10-15): coarse quantization, lower quality, fewer bits")
+    print("Input: (batch, 576) MDCT coefficients")
+    print(f"Output: (batch, {NUM_BANDS}) scalefactors")
+    print("Scalefactor range: [0, 15]")
+    print("  Low SF (0-5): fine quantization, high quality, more bits")
+    print("  High SF (10-15): coarse quantization, lower quality, fewer bits")
 
     return True
 
@@ -246,7 +246,7 @@ Examples:
 
     if success:
         print(f"\n✓ Export complete: {args.output}")
-        print(f"\nCopy to notlame-lib:")
+        print("\nCopy to notlame-lib:")
         print(f"  cp {args.output} ../notlame-lib/models/")
     else:
         print("\n✗ Export failed")

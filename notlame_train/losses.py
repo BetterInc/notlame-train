@@ -10,6 +10,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .model import NUM_BANDS, SCALEFACTOR_BANDS_LONG
+
 
 class STFTLoss(nn.Module):
     """STFT-based loss function.
@@ -420,13 +422,6 @@ class MDCTLoss(nn.Module):
     Based on equal-loudness contours and critical band importance.
     """
 
-    # MP3 scalefactor band boundaries (21 bands, 576 coefficients)
-    BAND_BOUNDARIES = [
-        0, 4, 8, 12, 16, 20, 24, 30, 36, 44,
-        52, 62, 74, 90, 110, 134, 162, 196, 238, 288,
-        342, 418, 576
-    ]
-
     def __init__(self, use_perceptual_weights: bool = True):
         super().__init__()
 
@@ -438,16 +433,16 @@ class MDCTLoss(nn.Module):
             # Perceptual importance by band (empirically derived)
             # Bands 0-6: highest importance (bass, fundamentals)
             # Bands 7-14: medium importance (mids, harmonics)
-            # Bands 15-20: lower importance (highs, less sensitive)
+            # Bands 15-21: lower importance (highs, less sensitive)
             band_importance = [
                 3.0, 3.0, 2.5, 2.5, 2.0, 2.0, 1.8,  # Bands 0-6: bass/low-mids
                 1.5, 1.5, 1.3, 1.3, 1.2, 1.2, 1.1, 1.1,  # Bands 7-14: mids
-                1.0, 0.9, 0.8, 0.7, 0.6, 0.5,  # Bands 15-20: highs
+                1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4,  # Bands 15-21: highs (added band 21)
             ]
 
-            for i in range(21):
-                start = self.BAND_BOUNDARIES[i]
-                end = self.BAND_BOUNDARIES[i + 1]
+            for i in range(NUM_BANDS):
+                start = SCALEFACTOR_BANDS_LONG[i]
+                end = SCALEFACTOR_BANDS_LONG[i + 1]
                 weights[start:end] = band_importance[i]
 
             # Normalize so mean weight = 1.0
@@ -593,13 +588,6 @@ class RateDistortionLoss(nn.Module):
     - High SF = worse quality but fewer bits
     """
 
-    # MP3 scalefactor band boundaries
-    BAND_BOUNDARIES = [
-        0, 4, 8, 12, 16, 20, 24, 30, 36, 44,
-        52, 62, 74, 90, 110, 134, 162, 196, 238, 288,
-        342, 418, 576
-    ]
-
     def __init__(
         self,
         rate_weight: float = 0.01,
@@ -627,7 +615,7 @@ class RateDistortionLoss(nn.Module):
         Args:
             quantized: (batch, 576) quantized/reconstructed MDCT coefficients
             original: (batch, 576) original MDCT coefficients
-            scalefactors: (batch, 21) predicted scalefactors [0-15]
+            scalefactors: (batch, NUM_BANDS) predicted scalefactors [0-15]
 
         Returns:
             dict with loss components:
@@ -648,14 +636,13 @@ class RateDistortionLoss(nn.Module):
 
         # Energy-adaptive rate: penalize more for high-energy bands using low SF
         # (high-energy bands with low SF = lots of bits spent)
-        batch_size = quantized.shape[0]
         band_energies = []
-        for i in range(21):
-            start = self.BAND_BOUNDARIES[i]
-            end = self.BAND_BOUNDARIES[i + 1]
+        for i in range(NUM_BANDS):
+            start = SCALEFACTOR_BANDS_LONG[i]
+            end = SCALEFACTOR_BANDS_LONG[i + 1]
             band_energy = torch.mean(original[:, start:end] ** 2, dim=1)
             band_energies.append(band_energy)
-        band_energies = torch.stack(band_energies, dim=1)  # (batch, 21)
+        band_energies = torch.stack(band_energies, dim=1)  # (batch, NUM_BANDS)
 
         # Normalize energies
         energy_norm = band_energies / (band_energies.max(dim=1, keepdim=True)[0] + 1e-8)
@@ -706,8 +693,8 @@ if __name__ == "__main__":
     print(f"Perceptual total: {losses['total']:.4f}")
 
     # Test combined loss
-    scalefactors = torch.rand(batch_size, 21) * 15
-    energy = torch.rand(batch_size, 21)
+    scalefactors = torch.rand(batch_size, NUM_BANDS) * 15
+    energy = torch.rand(batch_size, NUM_BANDS)
 
     combined = CombinedLoss()
     losses = combined(x, y, scalefactors, energy)

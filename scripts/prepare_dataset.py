@@ -17,10 +17,10 @@ import numpy as np
 import soundfile as sf
 from tqdm import tqdm
 
-# MP3 constants
-FRAME_SIZE = 1152  # Samples per MP3 frame (2 granules)
-GRANULE_SIZE = 576  # Samples per granule
-HOP_SIZE = 576  # 50% overlap
+# Add parent to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from notlame_train.model import FRAME_SIZE, HOP_SIZE
+
 TARGET_SR = 44100
 
 
@@ -139,7 +139,7 @@ def process_file(
                 "duration": len(existing) * 576 / 44100,
                 "skipped": True,
             }
-        except:
+        except Exception:
             pass  # Re-process if can't load
 
     try:
@@ -155,7 +155,6 @@ def process_file(
         # Handle duplicates (if same name from different dirs)
         if output_path.exists():
             counter = 1
-            base_path = output_dir / f"{rel_path}"
             while output_path.exists():
                 output_path = output_dir / f"{rel_path}_{counter}.npy"
                 counter += 1

@@ -18,7 +18,7 @@ import json
 import os
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -178,8 +178,7 @@ def validate_file(filepath: Path) -> ValidationResult:
             elif "PCM_32" in info.subtype:
                 result.bit_depth = 32
 
-        # Check sample rate (MP3 supports 22050, 24000, 32000, 44100, 48000 Hz)
-        valid_sample_rates = [22050, 24000, 32000, 44100, 48000]
+        # Check sample rate (MP3 supports 22050+ Hz)
         if info.samplerate < 22050:
             result.exclude_reason = "low_sample_rate"
             result.error = f"Sample rate too low: {info.samplerate} Hz (min 22050)"

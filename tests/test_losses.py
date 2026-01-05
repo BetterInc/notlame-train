@@ -7,7 +7,8 @@ import numpy as np
 import torch
 
 from notlame_train.differentiable_mp3 import DifferentiableMP3, DifferentiableMDCT
-from notlame_train.losses import MultiResolutionSTFTLoss, MelSpectrogramLoss, MultiScaleMelLoss
+from notlame_train.losses import MultiResolutionSTFTLoss, MultiScaleMelLoss
+from notlame_train.model import NUM_BANDS
 from notlame_train import config
 
 
@@ -49,8 +50,6 @@ def test_losses():
         use_l2=config.MEL_USE_L2,
     )
 
-    all_passed = True
-
     for sf_val in [0, 7.5, 15]:
         print(f"\n--- Scalefactor = {sf_val} ---")
 
@@ -64,7 +63,7 @@ def test_losses():
             coeffs = torch.from_numpy(data[:4]).float()  # 4 frames
 
             # Quantize with fixed scalefactor
-            sf = torch.full((4, 21), sf_val)
+            sf = torch.full((4, NUM_BANDS), sf_val)
             quantized = mp3.encode_coeffs(coeffs, sf, thresholds=None)
 
             # Convert to audio
@@ -100,8 +99,8 @@ def test_losses():
     # Test SF=0 vs SF=15
     coeffs = torch.from_numpy(np.load(files[0])[:4]).float()
 
-    sf_low = torch.full((4, 21), 0.0)
-    sf_high = torch.full((4, 21), 15.0)
+    sf_low = torch.full((4, NUM_BANDS), 0.0)
+    sf_high = torch.full((4, NUM_BANDS), 15.0)
 
     q_low = mp3.encode_coeffs(coeffs, sf_low, thresholds=None)
     q_high = mp3.encode_coeffs(coeffs, sf_high, thresholds=None)
@@ -121,7 +120,7 @@ def test_losses():
     mel_low = mel_loss(audio_low, audio_orig).item()
     mel_high = mel_loss(audio_high, audio_orig).item()
 
-    print(f"\nSF=0 vs SF=15 comparison:")
+    print("\nSF=0 vs SF=15 comparison:")
     print(f"  SNR:     {snr_low:.1f} vs {snr_high:.1f} dB  (diff: {snr_low - snr_high:.1f})")
     print(f"  MR-STFT: {stft_low:.4f} vs {stft_high:.4f}  (diff: {stft_high - stft_low:.4f})")
     print(f"  Mel:     {mel_low:.4f} vs {mel_high:.4f}  (diff: {mel_high - mel_low:.4f})")
@@ -156,7 +155,7 @@ def test_losses():
     # Gradient flow test
     print("\n--- Gradient Flow Test ---")
     coeffs.requires_grad = True
-    sf = torch.rand(4, 21) * 15
+    sf = torch.rand(4, NUM_BANDS) * 15
     sf.requires_grad = True
 
     quantized = mp3.encode_coeffs(coeffs, sf, thresholds=None)
@@ -257,7 +256,7 @@ def test_training_step():
         rate_weight * rate_penalty
     )
 
-    print(f"\nLoss components:")
+    print("\nLoss components:")
     print(f"  MDCT:  {mdct_l.item():.4f} (weight={mdct_weight})")
     print(f"  STFT:  {stft_l.item():.4f} (weight={stft_weight})")
     print(f"  Mel:   {mel_l.item():.4f} (weight={mel_weight})")
@@ -307,7 +306,7 @@ def test_training_step():
         print(f"✓ Mel loss dominates (weighted: {weighted_mel:.2f} vs STFT: {weighted_stft:.2f})")
         checks.append(True)
     else:
-        print(f"✗ Mel should dominate but doesn't")
+        print("✗ Mel should dominate but doesn't")
         checks.append(False)
 
     print("\n" + "=" * 60)

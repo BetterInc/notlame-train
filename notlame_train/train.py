@@ -5,10 +5,7 @@ Trains the neural psychoacoustic model with perceptual losses.
 """
 
 import argparse
-import json
-import os
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -19,10 +16,10 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from .model import PsychoNet, create_model, count_parameters
-from .differentiable_mp3 import DifferentiableMP3, DifferentiableMDCT, compute_mdct_energy, process_coeffs_through_model
-from .losses import MDCTLoss, PerceptualLoss, RateDistortionLoss, MultiResolutionSTFTLoss, MelSpectrogramLoss, MultiScaleMelLoss
-from .dataset import create_dataloader, create_train_val_dataloaders
+from .model import create_model, count_parameters
+from .differentiable_mp3 import DifferentiableMP3, DifferentiableMDCT, process_coeffs_through_model
+from .losses import RateDistortionLoss, MultiResolutionSTFTLoss, MultiScaleMelLoss
+from .dataset import create_train_val_dataloaders
 from . import config
 
 

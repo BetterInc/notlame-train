@@ -6,13 +6,10 @@ Downloads LibriSpeech (speech), FMA (music), and other audio datasets.
 
 import argparse
 import hashlib
-import os
-import shutil
 import tarfile
 import zipfile
 from pathlib import Path
-from urllib.request import urlretrieve, urlopen
-import json
+from urllib.request import urlretrieve
 
 from tqdm import tqdm
 
@@ -197,7 +194,7 @@ def download_file(url: str, output_path: Path, expected_md5: str = None) -> bool
         print("Verifying MD5...")
         actual_md5 = get_md5(output_path)
         if actual_md5 != expected_md5:
-            print(f"  ERROR: MD5 mismatch!")
+            print("  ERROR: MD5 mismatch!")
             print(f"  Expected: {expected_md5}")
             print(f"  Got: {actual_md5}")
             return False

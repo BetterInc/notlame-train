@@ -21,7 +21,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, List, Dict
 
 import numpy as np
 import soundfile as sf
@@ -205,7 +205,6 @@ def compute_visqol(reference_path: str, degraded_path: str,
     try:
         from visqol import visqol_lib_py
         from visqol.pb2 import visqol_config_pb2
-        from visqol.pb2 import similarity_result_pb2
 
         config = visqol_config_pb2.VisqolConfig()
 
@@ -429,7 +428,7 @@ class Evaluator:
                         result["lame"]["visqol"] = visqol_lame
                         result["winner"]["visqol"] = "notlame" if visqol_notlame > visqol_lame else "lame"
 
-            except Exception as e:
+            except Exception:
                 pass  # ViSQOL is optional
 
         return result

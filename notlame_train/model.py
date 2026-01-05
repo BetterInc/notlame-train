@@ -2,29 +2,28 @@
 
 Replaces LAME's psychoacoustic model with a learned approach.
 Input: 576 MDCT coefficients (one granule)
-Output: 21 scalefactor band allocations + masking thresholds
+Output: 22 scalefactor band allocations + masking thresholds
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
-# MP3 scalefactor band boundaries (long blocks, 44.1kHz)
-# 21 bands covering 576 MDCT coefficients
+# =============================================================================
+# MP3 Constants (single source of truth)
+# =============================================================================
+FRAME_SIZE = 1152         # Samples per MP3 frame (2 granules)
+MDCT_SIZE = 576           # MDCT coefficients per frame (FRAME_SIZE // 2)
+HOP_SIZE = 576            # 50% overlap
+
+# Scalefactor band boundaries (long blocks, 44.1kHz)
+# 22 bands covering all 576 MDCT coefficients (indices 0-575)
 SCALEFACTOR_BANDS_LONG = [
     0, 4, 8, 12, 16, 20, 24, 30, 36, 44,
     52, 62, 74, 90, 110, 134, 162, 196, 238, 288,
     342, 418, 576
 ]
-
-# Short block boundaries (not used in this version)
-SCALEFACTOR_BANDS_SHORT = [
-    0, 4, 8, 12, 16, 22, 30, 40, 52, 66,
-    84, 106, 192
-]
-
-NUM_BANDS = 21
+NUM_BANDS = len(SCALEFACTOR_BANDS_LONG) - 1  # 22 bands
 
 
 class FrequencyAttention(nn.Module):
@@ -77,7 +76,7 @@ class PsychoNet(nn.Module):
     3. Output: scalefactor allocations + masking thresholds
 
     Input: (batch, 576) - MDCT coefficients
-    Output: (batch, 42) - 21 scalefactors + 21 thresholds
+    Output: (batch, 44) - 22 scalefactors + 22 thresholds
     """
 
     def __init__(
@@ -160,9 +159,8 @@ class PsychoNet(nn.Module):
             x: (batch, 576) MDCT coefficients
 
         Returns:
-            (batch, 21, hidden_dim) band features
+            (batch, NUM_BANDS, hidden_dim) band features
         """
-        batch_size = x.shape[0]
         band_features = []
 
         for i in range(self.num_bands):
