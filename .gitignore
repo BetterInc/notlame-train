@@ -1,0 +1,77 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data - don't commit large files
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Model checkpoints - too large
+checkpoints/*
+!checkpoints/.gitkeep
+
+# Exported models - too large for git
+models/*.onnx
+models/*.onnx.data
+
+# TensorBoard
+runs/
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+nohup.out
+
+# Claude Code
+.claude/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Test samples - audio files too large for git
+tests/samples/*.wav
+tests/samples/*.mp3
+!tests/samples/.gitkeep
+
+# Validation reports
+validation_report.json
+evaluation_report.json
