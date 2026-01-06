@@ -16,14 +16,30 @@ FRAME_SIZE = 1152         # Samples per MP3 frame (2 granules)
 MDCT_SIZE = 576           # MDCT coefficients per frame (FRAME_SIZE // 2)
 HOP_SIZE = 576            # 50% overlap
 
-# Scalefactor band boundaries (long blocks, 44.1kHz)
+# Scalefactor band boundaries (long blocks) for different sample rates
+# From ISO/IEC 11172-3 (MPEG-1 Layer III)
 # 22 bands covering all 576 MDCT coefficients (indices 0-575)
-SCALEFACTOR_BANDS_LONG = [
-    0, 4, 8, 12, 16, 20, 24, 30, 36, 44,
-    52, 62, 74, 90, 110, 134, 162, 196, 238, 288,
-    342, 418, 576
-]
+SCALEFACTOR_BANDS_BY_SR = {
+    # MPEG-1 sample rates
+    44100: [0, 4, 8, 12, 16, 20, 24, 30, 36, 44, 52, 62, 74, 90, 110, 134, 162, 196, 238, 288, 342, 418, 576],
+    48000: [0, 4, 8, 12, 16, 20, 24, 30, 36, 42, 50, 60, 72, 88, 106, 128, 156, 190, 230, 276, 330, 384, 576],
+    32000: [0, 4, 8, 12, 16, 20, 24, 30, 36, 44, 54, 66, 82, 102, 126, 156, 194, 240, 296, 364, 448, 550, 576],
+}
+SUPPORTED_SAMPLE_RATES = list(SCALEFACTOR_BANDS_BY_SR.keys())
+DEFAULT_SAMPLE_RATE = 44100
+
+# Default bands (44.1kHz for backwards compatibility)
+SCALEFACTOR_BANDS_LONG = SCALEFACTOR_BANDS_BY_SR[DEFAULT_SAMPLE_RATE]
 NUM_BANDS = len(SCALEFACTOR_BANDS_LONG) - 1  # 22 bands
+
+
+def get_scalefactor_bands(sample_rate: int) -> list:
+    """Get scalefactor band boundaries for a given sample rate."""
+    if sample_rate in SCALEFACTOR_BANDS_BY_SR:
+        return SCALEFACTOR_BANDS_BY_SR[sample_rate]
+    # Fall back to nearest supported sample rate
+    nearest = min(SUPPORTED_SAMPLE_RATES, key=lambda sr: abs(sr - sample_rate))
+    return SCALEFACTOR_BANDS_BY_SR[nearest]
 
 
 class FrequencyAttention(nn.Module):

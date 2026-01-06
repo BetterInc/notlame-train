@@ -20,14 +20,13 @@ import os
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 
 import numpy as np
 import soundfile as sf
 import torch
-from tqdm import tqdm
-
 from .model import create_model
 from .differentiable_mp3 import DifferentiableMP3, DifferentiableMDCT, process_audio_through_model
 from . import config
@@ -312,15 +311,80 @@ class Evaluator:
         self.model.to(self.device)
         self.model.eval()
 
+        # Get model's training sample rate from checkpoint (default to config if not present)
+        self.model_sample_rate = checkpoint.get("sample_rate", config.MODEL_SAMPLE_RATE)
+
         # Pipeline components
         self.mdct = DifferentiableMDCT().to(self.device)
         self.mp3 = DifferentiableMP3().to(self.device)
 
-        print(f"Loaded model from {model_path} (device: {self.device})")
+        print(f"Loaded model from {model_path} (device: {self.device}, sample_rate: {self.model_sample_rate}Hz)")
+
+    @torch.no_grad()
+    def encode_decode_batch(self, audios: List[np.ndarray], sample_rates: List[int]) -> List[np.ndarray]:
+        """Batch encode/decode multiple audio files on GPU.
+
+        All audio is resampled to model's sample rate, batched, processed, then resampled back.
+        """
+        model_sr = self.model_sample_rate
+
+        # Resample all to model sample rate
+        resampled = []
+        for audio, sr in zip(audios, sample_rates):
+            if sr != model_sr:
+                audio = config.resample_audio(audio, sr, model_sr)
+            resampled.append(audio)
+
+        # Find max length and pad all to same length
+        max_len = max(len(a) for a in resampled)
+        # Pad to multiple of 576 (MDCT frame size)
+        max_len = ((max_len + 575) // 576) * 576
+
+        padded = []
+        original_lens = []
+        for audio in resampled:
+            original_lens.append(len(audio))
+            if len(audio) < max_len:
+                audio = np.pad(audio, (0, max_len - len(audio)), mode='constant')
+            padded.append(audio)
+
+        # Stack into batch tensor
+        batch = np.stack(padded, axis=0)
+        batch_tensor = torch.from_numpy(batch).float().to(self.device)
+
+        # Process batch through model
+        results = []
+        for i in range(len(batch_tensor)):
+            reconstructed, _, _, _, _ = process_audio_through_model(
+                batch_tensor[i], self.model, self.mdct, self.mp3
+            )
+            result = reconstructed[0].cpu().numpy()
+            # Trim to original length
+            result = result[:original_lens[i]]
+            results.append(result)
+
+        # Resample back to original sample rates
+        final_results = []
+        for result, sr in zip(results, sample_rates):
+            if sr != model_sr:
+                result = config.resample_audio(result, model_sr, sr)
+            final_results.append(result)
+
+        return final_results
 
     @torch.no_grad()
     def encode_decode(self, audio: np.ndarray, sample_rate: int = 44100) -> np.ndarray:
-        """Encode audio with neural model and decode back."""
+        """Encode audio with neural model and decode back.
+
+        Automatically resamples to model's training sample rate if needed.
+        """
+        # Use sample rate from checkpoint (stored during training)
+        model_sr = self.model_sample_rate
+
+        # Resample to model's sample rate if needed
+        if sample_rate != model_sr:
+            audio = config.resample_audio(audio, sample_rate, model_sr)
+
         # Convert to tensor
         audio_tensor = torch.from_numpy(audio).float().to(self.device)
 
@@ -329,7 +393,13 @@ class Evaluator:
             audio_tensor, self.model, self.mdct, self.mp3
         )
 
-        return reconstructed[0].cpu().numpy()
+        result = reconstructed[0].cpu().numpy()
+
+        # Resample back to original sample rate if needed
+        if sample_rate != model_sr:
+            result = config.resample_audio(result, model_sr, sample_rate)
+
+        return result
 
     def evaluate_file(self, audio_path: Path, bitrate: int = 192) -> dict:
         """Evaluate on a single audio file with all metrics."""
@@ -434,8 +504,190 @@ class Evaluator:
         return result
 
 
+def _load_audio(filepath: Path) -> Tuple[Optional[np.ndarray], Optional[int], Path, Optional[str]]:
+    """Load and normalize a single audio file. Returns (audio, sr, path, error)."""
+    try:
+        audio, sr = sf.read(str(filepath))
+        if len(audio.shape) > 1:
+            audio = np.mean(audio, axis=1)
+        audio = audio.astype(np.float32)
+        max_val = np.max(np.abs(audio))
+        if max_val > 0:
+            audio = audio / max_val
+        return audio, sr, filepath, None
+    except Exception as e:
+        return None, None, filepath, str(e)
+
+
+def _compute_lame_and_metrics(args: Tuple) -> dict:
+    """Compute LAME encoding and all metrics for one file (runs in thread pool)."""
+    audio, sr, notlame_audio, filepath, bitrate = args
+
+    result = {
+        "file": filepath.name,
+        "duration": len(audio) / sr,
+        "sample_rate": sr,
+    }
+
+    # notlame metrics
+    result["notlame"] = {
+        "snr": compute_snr(audio, notlame_audio),
+        "mr_stft": compute_multi_resolution_stft(audio, notlame_audio)["total"],
+        "mel": compute_mel_distance(audio, notlame_audio, sr),
+    }
+
+    # LAME comparison
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        wav_path = tmpdir / "original.wav"
+        mp3_path = tmpdir / "lame.mp3"
+        lame_wav_path = tmpdir / "lame_decoded.wav"
+
+        sf.write(wav_path, audio, sr)
+
+        if encode_with_lame(str(wav_path), str(mp3_path), bitrate):
+            if decode_mp3(str(mp3_path), str(lame_wav_path)):
+                lame_audio, _ = sf.read(str(lame_wav_path))
+                if len(lame_audio.shape) > 1:
+                    lame_audio = np.mean(lame_audio, axis=1)
+
+                result["lame"] = {
+                    "snr": compute_snr(audio, lame_audio),
+                    "mr_stft": compute_multi_resolution_stft(audio, lame_audio)["total"],
+                    "mel": compute_mel_distance(audio, lame_audio, sr),
+                }
+
+                result["winner"] = {
+                    "snr": "notlame" if result["notlame"]["snr"] > result["lame"]["snr"] else "lame",
+                    "mr_stft": "notlame" if result["notlame"]["mr_stft"] < result["lame"]["mr_stft"] else "lame",
+                    "mel": "notlame" if result["notlame"]["mel"] < result["lame"]["mel"] else "lame",
+                }
+
+    return result
+
+
+def evaluate_directory_batched(evaluator: Evaluator, test_dir: Path,
+                               bitrate: int = 192, max_files: int = None,
+                               batch_size: int = 32, num_workers: int = 8,
+                               verbose: bool = True) -> dict:
+    """Evaluate with GPU batching and parallel CPU processing."""
+    # Find audio files
+    extensions = [".wav", ".flac", ".mp3", ".ogg"]
+    files = []
+    for ext in extensions:
+        files.extend(test_dir.rglob(f"*{ext}"))
+        files.extend(test_dir.rglob(f"*{ext.upper()}"))
+
+    files = [f for f in files if not f.name.startswith("._")]
+    files = sorted(set(files))
+
+    if max_files:
+        files = files[:max_files]
+
+    if not files:
+        print(f"No audio files found in {test_dir}")
+        return {"error": "No files found"}
+
+    print(f"\nEvaluating {len(files)} files at {bitrate} kbps (batched, {num_workers} workers)...")
+    print(f"Model sample rate: {evaluator.model_sample_rate} Hz")
+
+    # Step 1: Load all audio files in parallel
+    print("Loading audio files...")
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        loaded = list(executor.map(_load_audio, files))
+
+    # Filter out failed loads
+    audios = []
+    sample_rates = []
+    filepaths = []
+    failed = []
+    for item in loaded:
+        audio, sr, filepath, error = item
+        if error is None:
+            audios.append(audio)
+            sample_rates.append(sr)
+            filepaths.append(filepath)
+        else:
+            failed.append((filepath, error))
+
+    if failed:
+        print(f"  Skipped {len(failed)} corrupted files:")
+        for fp, err in failed[:5]:  # Show first 5
+            print(f"    - {fp.name}: {err[:50]}")
+        if len(failed) > 5:
+            print(f"    ... and {len(failed) - 5} more")
+    print(f"  Loaded {len(audios)} files successfully")
+
+    # Step 2: Process through model in batches
+    print("Processing through neural model...")
+    notlame_audios = []
+    for i in range(0, len(audios), batch_size):
+        batch_audios = audios[i:i+batch_size]
+        batch_srs = sample_rates[i:i+batch_size]
+        batch_results = evaluator.encode_decode_batch(batch_audios, batch_srs)
+        notlame_audios.extend(batch_results)
+        print(f"  Processed {min(i+batch_size, len(audios))}/{len(audios)} files")
+
+    # Step 3: Compute LAME encoding and metrics in parallel
+    print("Computing LAME comparisons and metrics...")
+    metric_args = [
+        (audio, sr, notlame_audio, filepath, bitrate)
+        for audio, sr, notlame_audio, filepath in zip(audios, sample_rates, notlame_audios, filepaths)
+    ]
+
+    results = []
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        for result in executor.map(_compute_lame_and_metrics, metric_args):
+            results.append(result)
+
+    # Print verbose output
+    if verbose:
+        print("\n" + "=" * 90)
+        print(f"{'File':<25} {'Dur':>5} {'SR':>6} | {'SNR':>8} {'STFT':>8} {'Mel':>8} | Winner")
+        print("=" * 90)
+
+        running_wins = {"snr": 0, "mr_stft": 0, "mel": 0}
+        for result in results:
+            if "notlame" in result:
+                name = result["file"][:24]
+                dur = f"{result['duration']:.1f}s"
+                sr = f"{result['sample_rate']//1000}k"
+
+                n = result["notlame"]
+                snr_n = n["snr"]
+                stft_n = n["mr_stft"]
+                mel_n = n["mel"]
+
+                winners = result.get("winner", {})
+                snr_w = "✓" if winners.get("snr") == "notlame" else "✗"
+                stft_w = "✓" if winners.get("mr_stft") == "notlame" else "✗"
+                mel_w = "✓" if winners.get("mel") == "notlame" else "✗"
+
+                if winners.get("snr") == "notlame":
+                    running_wins["snr"] += 1
+                if winners.get("mr_stft") == "notlame":
+                    running_wins["mr_stft"] += 1
+                if winners.get("mel") == "notlame":
+                    running_wins["mel"] += 1
+
+                file_wins = sum(1 for w in winners.values() if w == "notlame")
+                overall = "WIN" if file_wins >= 2 else "LOSE"
+
+                print(f"{name:<25} {dur:>5} {sr:>6} | "
+                      f"{snr_n:>7.1f}{snr_w} {stft_n:>7.3f}{stft_w} {mel_n:>7.4f}{mel_w} | {overall}")
+
+        n = len(results)
+        print("=" * 90)
+        print(f"{'RUNNING TOTALS':<25} {'':<12} | "
+              f"{running_wins['snr']:>3}/{n:<4}  {running_wins['mr_stft']:>3}/{n:<4}  {running_wins['mel']:>3}/{n:<4}  |")
+        print("=" * 90)
+
+    return aggregate_results(results)
+
+
 def evaluate_directory(evaluator: Evaluator, test_dir: Path,
-                       bitrate: int = 192, max_files: int = None) -> dict:
+                       bitrate: int = 192, max_files: int = None,
+                       verbose: bool = True) -> dict:
     """Evaluate all audio files in a directory."""
     # Find audio files
     extensions = [".wav", ".flac", ".mp3", ".ogg"]
@@ -456,14 +708,63 @@ def evaluate_directory(evaluator: Evaluator, test_dir: Path,
         return {"error": "No files found"}
 
     print(f"\nEvaluating {len(files)} files at {bitrate} kbps...")
+    print(f"Model sample rate: {evaluator.model_sample_rate} Hz")
+
+    if verbose:
+        print("\n" + "=" * 90)
+        print(f"{'File':<25} {'Dur':>5} {'SR':>6} | {'SNR':>8} {'STFT':>8} {'Mel':>8} | Winner")
+        print("=" * 90)
 
     results = []
-    for filepath in tqdm(files, desc="Evaluating"):
+    running_wins = {"snr": 0, "mr_stft": 0, "mel": 0}
+
+    for i, filepath in enumerate(files):
         try:
             result = evaluator.evaluate_file(filepath, bitrate)
             results.append(result)
+
+            if verbose and "notlame" in result:
+                # Format file info
+                name = result["file"][:24]
+                dur = f"{result['duration']:.1f}s"
+                sr = f"{result['sample_rate']//1000}k"
+
+                # Get metrics (handle string values from model)
+                n = result["notlame"]
+                snr_n = float(n["snr"]) if isinstance(n["snr"], str) else n["snr"]
+                stft_n = float(n["mr_stft"]) if isinstance(n["mr_stft"], str) else n["mr_stft"]
+                mel_n = float(n["mel"]) if isinstance(n["mel"], str) else n["mel"]
+
+                # Format winner indicators
+                winners = result.get("winner", {})
+                snr_w = "✓" if winners.get("snr") == "notlame" else "✗"
+                stft_w = "✓" if winners.get("mr_stft") == "notlame" else "✗"
+                mel_w = "✓" if winners.get("mel") == "notlame" else "✗"
+
+                # Count wins
+                if winners.get("snr") == "notlame":
+                    running_wins["snr"] += 1
+                if winners.get("mr_stft") == "notlame":
+                    running_wins["mr_stft"] += 1
+                if winners.get("mel") == "notlame":
+                    running_wins["mel"] += 1
+
+                # Overall winner for this file
+                file_wins = sum(1 for w in winners.values() if w == "notlame")
+                overall = "WIN" if file_wins >= 2 else "LOSE"
+
+                print(f"{name:<25} {dur:>5} {sr:>6} | "
+                      f"{snr_n:>7.1f}{snr_w} {stft_n:>7.3f}{stft_w} {mel_n:>7.4f}{mel_w} | {overall}")
+
         except Exception as e:
             print(f"\nError processing {filepath.name}: {e}")
+
+    if verbose and results:
+        n = len(results)
+        print("=" * 90)
+        print(f"{'RUNNING TOTALS':<25} {'':<12} | "
+              f"{running_wins['snr']:>3}/{n:<4}  {running_wins['mr_stft']:>3}/{n:<4}  {running_wins['mel']:>3}/{n:<4}  |")
+        print("=" * 90)
 
     # Aggregate statistics
     return aggregate_results(results)
@@ -642,6 +943,14 @@ Example:
                         help="Maximum files to evaluate")
     parser.add_argument("--device", default="cuda",
                         help="Device (default: cuda)")
+    parser.add_argument("--quiet", "-q", action="store_true",
+                        help="Quiet mode (no per-file output)")
+    parser.add_argument("--batch-size", type=int, default=32,
+                        help="Batch size for GPU processing (default: 32)")
+    parser.add_argument("--workers", type=int, default=8,
+                        help="Number of parallel workers for I/O and metrics (default: 8)")
+    parser.add_argument("--sequential", action="store_true",
+                        help="Use sequential processing instead of batched (slower)")
 
     args = parser.parse_args()
 
@@ -660,13 +969,25 @@ Example:
         device=args.device,
     )
 
-    # Evaluate
-    report = evaluate_directory(
-        evaluator,
-        args.test_dir,
-        bitrate=args.bitrate,
-        max_files=args.max_files,
-    )
+    # Evaluate (use batched by default for speed)
+    if args.sequential:
+        report = evaluate_directory(
+            evaluator,
+            args.test_dir,
+            bitrate=args.bitrate,
+            max_files=args.max_files,
+            verbose=not args.quiet,
+        )
+    else:
+        report = evaluate_directory_batched(
+            evaluator,
+            args.test_dir,
+            bitrate=args.bitrate,
+            max_files=args.max_files,
+            batch_size=args.batch_size,
+            num_workers=args.workers,
+            verbose=not args.quiet,
+        )
 
     # Print report
     print_report(report)

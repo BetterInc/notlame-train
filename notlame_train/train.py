@@ -16,11 +16,14 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from .model import create_model, count_parameters
+from .model import create_model, count_parameters, SCALEFACTOR_BANDS_BY_SR
 from .differentiable_mp3 import DifferentiableMP3, DifferentiableMDCT, process_coeffs_through_model
 from .losses import RateDistortionLoss, MultiResolutionSTFTLoss, MultiScaleMelLoss
 from .dataset import create_train_val_dataloaders
 from . import config
+
+# Training sample rate - model architecture is tied to this
+TRAIN_SAMPLE_RATE = config.MODEL_SAMPLE_RATE
 
 
 class Trainer:
@@ -38,12 +41,14 @@ class Trainer:
         log_dir: Path = Path("runs"),
         experiment_name: Optional[str] = None,
         frames_per_sample: int = 4,
+        sample_rate: int = TRAIN_SAMPLE_RATE,
     ):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.model = model.to(self.device)
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.frames_per_sample = frames_per_sample
+        self.sample_rate = sample_rate  # Store for checkpoint
 
         # Optimizer
         self.optimizer = optim.AdamW(
@@ -75,8 +80,9 @@ class Trainer:
         ).to(self.device)
 
         # Multi-scale mel loss (DAC-style)
+        # Use training sample rate for mel computation
         self.mel_loss = MultiScaleMelLoss(
-            sample_rate=config.MEL_SAMPLE_RATE,
+            sample_rate=self.sample_rate,
             window_lengths=config.MEL_WINDOW_LENGTHS,
             n_mels=config.MEL_N_MELS,
             use_l2=config.MEL_USE_L2,
@@ -110,6 +116,7 @@ class Trainer:
         self.best_loss = float("inf")
 
         print(f"Device: {self.device}")
+        print(f"Sample rate: {self.sample_rate} Hz")
         print(f"Model parameters: {count_parameters(model):,}")
         print(f"Checkpoints: {self.checkpoint_dir}")
         print(f"TensorBoard: {self.log_dir}")
@@ -271,6 +278,9 @@ class Trainer:
             "global_step": self.global_step,
             "epoch": self.epoch,
             "best_loss": self.best_loss,
+            # Sample rate metadata - important for inference
+            "sample_rate": self.sample_rate,
+            "scalefactor_bands": SCALEFACTOR_BANDS_BY_SR.get(self.sample_rate),
         }
 
         path = self.checkpoint_dir / name
@@ -290,6 +300,12 @@ class Trainer:
         self.global_step = checkpoint["global_step"]
         self.epoch = checkpoint["epoch"]
         self.best_loss = checkpoint["best_loss"]
+
+        # Load sample rate if available (for backwards compatibility)
+        if "sample_rate" in checkpoint:
+            loaded_sr = checkpoint["sample_rate"]
+            if loaded_sr != self.sample_rate:
+                print(f"Warning: Checkpoint trained at {loaded_sr}Hz, current training at {self.sample_rate}Hz")
 
         print(f"Loaded checkpoint: step={self.global_step}, epoch={self.epoch}")
 
@@ -482,6 +498,16 @@ Examples:
         help="Cache all data in memory (faster, uses ~5GB RAM)",
     )
 
+    # Sample rate
+    parser.add_argument(
+        "--sample-rate",
+        type=int,
+        default=TRAIN_SAMPLE_RATE,
+        choices=config.SUPPORTED_SAMPLE_RATES,
+        help=f"Training sample rate (default: {TRAIN_SAMPLE_RATE}). "
+             f"Supported: {config.SUPPORTED_SAMPLE_RATES}",
+    )
+
     args = parser.parse_args()
 
     # Check data directory
@@ -524,6 +550,7 @@ Examples:
         device=args.device,
         checkpoint_dir=args.checkpoint_dir,
         experiment_name=args.experiment,
+        sample_rate=args.sample_rate,
     )
 
     # Resume if specified

@@ -14,6 +14,9 @@ from notlame_train.model import (
     count_parameters,
     NUM_BANDS,
     MDCT_SIZE,
+    SCALEFACTOR_BANDS_BY_SR,
+    SUPPORTED_SAMPLE_RATES,
+    get_scalefactor_bands,
 )
 
 
@@ -220,3 +223,66 @@ class TestModelDevice:
         output = model(x)
 
         assert output["scalefactors"].is_cuda
+
+
+class TestScalefactorBands:
+    """Test scalefactor band definitions per sample rate."""
+
+    def test_all_sample_rates_defined(self):
+        """All MPEG-1 sample rates should have band definitions."""
+        assert 44100 in SCALEFACTOR_BANDS_BY_SR
+        assert 48000 in SCALEFACTOR_BANDS_BY_SR
+        assert 32000 in SCALEFACTOR_BANDS_BY_SR
+
+    @pytest.mark.parametrize("sr", SUPPORTED_SAMPLE_RATES)
+    def test_bands_have_22_bands(self, sr):
+        """Each sample rate should have 22 scalefactor bands."""
+        bands = SCALEFACTOR_BANDS_BY_SR[sr]
+        assert len(bands) == 23, f"SR {sr}: expected 23 boundaries, got {len(bands)}"
+        assert len(bands) - 1 == NUM_BANDS
+
+    @pytest.mark.parametrize("sr", SUPPORTED_SAMPLE_RATES)
+    def test_bands_start_at_zero(self, sr):
+        """Bands should start at coefficient 0."""
+        bands = SCALEFACTOR_BANDS_BY_SR[sr]
+        assert bands[0] == 0
+
+    @pytest.mark.parametrize("sr", SUPPORTED_SAMPLE_RATES)
+    def test_bands_end_at_576(self, sr):
+        """Bands should end at coefficient 576 (MDCT_SIZE)."""
+        bands = SCALEFACTOR_BANDS_BY_SR[sr]
+        assert bands[-1] == MDCT_SIZE
+
+    @pytest.mark.parametrize("sr", SUPPORTED_SAMPLE_RATES)
+    def test_bands_monotonically_increasing(self, sr):
+        """Band boundaries should be monotonically increasing."""
+        bands = SCALEFACTOR_BANDS_BY_SR[sr]
+        for i in range(len(bands) - 1):
+            assert bands[i] < bands[i + 1], f"SR {sr}: band {i} not increasing"
+
+    def test_get_scalefactor_bands_known(self):
+        """get_scalefactor_bands should return correct bands for known rates."""
+        assert get_scalefactor_bands(44100) == SCALEFACTOR_BANDS_BY_SR[44100]
+        assert get_scalefactor_bands(48000) == SCALEFACTOR_BANDS_BY_SR[48000]
+        assert get_scalefactor_bands(32000) == SCALEFACTOR_BANDS_BY_SR[32000]
+
+    def test_get_scalefactor_bands_fallback(self):
+        """get_scalefactor_bands should fall back to nearest for unknown rates."""
+        # 96000 should fall back to 48000 (nearest)
+        bands_96k = get_scalefactor_bands(96000)
+        assert bands_96k == SCALEFACTOR_BANDS_BY_SR[48000]
+
+        # 22050 should fall back to 32000 (nearest)
+        bands_22k = get_scalefactor_bands(22050)
+        assert bands_22k == SCALEFACTOR_BANDS_BY_SR[32000]
+
+    def test_band_widths_differ_by_sr(self):
+        """Different sample rates should have different band widths."""
+        bands_44 = SCALEFACTOR_BANDS_BY_SR[44100]
+        bands_48 = SCALEFACTOR_BANDS_BY_SR[48000]
+
+        # They should be different (not identical)
+        assert bands_44 != bands_48, "44.1kHz and 48kHz bands should differ"
+
+        # But same number of bands
+        assert len(bands_44) == len(bands_48)

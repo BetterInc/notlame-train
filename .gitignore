@@ -42,6 +42,9 @@ data/processed/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 
+# Test data - tracked via Git LFS (GTZAN samples)
+!data/test/
+
 # Model checkpoints - too large
 checkpoints/*
 !checkpoints/.gitkeep

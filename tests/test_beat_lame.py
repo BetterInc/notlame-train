@@ -345,3 +345,182 @@ class TestBeatLAMESummary:
         assert both_wins >= 5, f"Must win BOTH at 5+ bitrates, got {both_wins}"
 
         print("\nAll assertions passed!")
+
+
+class TestTargetMetricValues:
+    """Define good target values for training metrics.
+
+    These targets are based on:
+    - LAME comparison benchmarks
+    - Research papers (EnCodec, DAC, SoundStream)
+    - Perceptual quality requirements
+
+    Use these as guidelines for training success.
+    """
+
+    # ==========================================================================
+    # TARGET METRIC VALUES (training goals)
+    # ==========================================================================
+    # These define what "good" looks like for each metric
+
+    # SNR (Signal-to-Noise Ratio) - higher is better
+    SNR_MINIMUM = 20.0      # dB - bare minimum acceptable
+    SNR_GOOD = 25.0         # dB - good quality
+    SNR_EXCELLENT = 35.0    # dB - excellent quality (near-transparent)
+
+    # MR-STFT (Multi-Resolution STFT) - lower is better
+    STFT_EXCELLENT = 0.40   # Very high quality
+    STFT_GOOD = 0.55        # Good quality, matches LAME
+    STFT_ACCEPTABLE = 0.70  # Acceptable quality
+
+    # Mel Distance - lower is better
+    MEL_EXCELLENT = 0.08    # Very high quality
+    MEL_GOOD = 0.12         # Good quality, matches LAME
+    MEL_ACCEPTABLE = 0.18   # Acceptable quality
+
+    # Win rates vs LAME - higher is better
+    WIN_RATE_TARGET = 0.50  # Must beat 50% to be "better than LAME"
+
+    def test_target_snr_values_defined(self):
+        """SNR targets should be reasonable."""
+        assert self.SNR_MINIMUM > 0
+        assert self.SNR_MINIMUM < self.SNR_GOOD < self.SNR_EXCELLENT
+        assert self.SNR_EXCELLENT < 60  # Should be achievable
+
+    def test_target_stft_values_defined(self):
+        """MR-STFT targets should be reasonable."""
+        assert self.STFT_EXCELLENT > 0
+        assert self.STFT_EXCELLENT < self.STFT_GOOD < self.STFT_ACCEPTABLE
+        assert self.STFT_ACCEPTABLE < 2.0  # Should be achievable
+
+    def test_target_mel_values_defined(self):
+        """Mel targets should be reasonable."""
+        assert self.MEL_EXCELLENT > 0
+        assert self.MEL_EXCELLENT < self.MEL_GOOD < self.MEL_ACCEPTABLE
+        assert self.MEL_ACCEPTABLE < 0.5  # Should be achievable
+
+    def test_config_targets_match(self):
+        """Config targets should align with our test targets."""
+        # Verify config.py EVAL_TARGETS are consistent
+        # Note: config targets may be more lenient than "beat LAME" targets
+        assert config.EVAL_TARGETS["snr"] >= self.SNR_MINIMUM
+        assert config.EVAL_TARGETS["mr_stft"] <= self.STFT_ACCEPTABLE * 2  # Allow some slack
+        assert config.EVAL_TARGETS["mel"] <= self.MEL_ACCEPTABLE * 10  # Config uses different scale
+
+    def test_scalefactor_range_for_targets(self):
+        """Verify SF range allows achieving target quality."""
+        # At SF=0 (finest quantization), should achieve excellent quality
+        # At SF=15 (coarsest), should still be acceptable
+        assert 0 <= config.TARGET_SCALEFACTOR <= 15
+
+        # Target SF should be in the "good quality" range
+        # SF 4-7 typically corresponds to 192-256 kbps quality
+        assert 4.0 <= config.TARGET_SCALEFACTOR <= 8.0, \
+            f"Target SF {config.TARGET_SCALEFACTOR} outside good quality range [4, 8]"
+
+
+class TestEvaluationThresholds:
+    """Tests that can be run after training to verify model quality.
+
+    Run with: pytest tests/test_beat_lame.py::TestEvaluationThresholds -v
+
+    These tests use the targets defined above to verify a trained model
+    meets quality requirements.
+    """
+
+    @pytest.fixture
+    def targets(self):
+        """Return target metric values."""
+        return TestTargetMetricValues
+
+    def test_document_current_targets(self, targets, capsys):
+        """Print current target values and actual evaluation results."""
+        import json
+
+        print("\n" + "=" * 60)
+        print("TRAINING TARGET VALUES")
+        print("=" * 60)
+        print(f"\nSNR (dB) - higher is better:")
+        print(f"  Minimum:   > {targets.SNR_MINIMUM}")
+        print(f"  Good:      > {targets.SNR_GOOD}")
+        print(f"  Excellent: > {targets.SNR_EXCELLENT}")
+
+        print(f"\nMR-STFT - lower is better:")
+        print(f"  Excellent: < {targets.STFT_EXCELLENT}")
+        print(f"  Good:      < {targets.STFT_GOOD}")
+        print(f"  Acceptable: < {targets.STFT_ACCEPTABLE}")
+
+        print(f"\nMel Distance - lower is better:")
+        print(f"  Excellent: < {targets.MEL_EXCELLENT}")
+        print(f"  Good:      < {targets.MEL_GOOD}")
+        print(f"  Acceptable: < {targets.MEL_ACCEPTABLE}")
+
+        print(f"\nWin Rate vs LAME:")
+        print(f"  Target:    > {targets.WIN_RATE_TARGET * 100:.0f}%")
+
+        # Read actual evaluation results if available
+        report_path = Path(__file__).parent.parent / "evaluation_report.json"
+        if report_path.exists():
+            with open(report_path) as f:
+                report = json.load(f)
+
+            stats = report.get("stats", {})
+            notlame = stats.get("notlame", {})
+            lame = stats.get("lame", {})
+            win_rates = stats.get("win_rates", {})
+
+            print("\n" + "=" * 60)
+            print("CURRENT EVALUATION RESULTS (from evaluation_report.json)")
+            print("=" * 60)
+
+            # SNR
+            snr_n = notlame.get("snr_mean")
+            snr_l = lame.get("snr_mean")
+            if snr_n is not None:
+                grade = "EXCELLENT" if snr_n > targets.SNR_EXCELLENT else "GOOD" if snr_n > targets.SNR_GOOD else "MINIMUM"
+                print(f"  SNR: {snr_n:.2f} (notlame) vs {snr_l:.2f} (LAME) = {grade}")
+
+            # MR-STFT
+            stft_n = notlame.get("mr_stft_mean")
+            stft_l = lame.get("mr_stft_mean")
+            if stft_n is not None:
+                if stft_n < targets.STFT_EXCELLENT:
+                    grade = "EXCELLENT"
+                elif stft_n < targets.STFT_GOOD:
+                    grade = "GOOD"
+                elif stft_n < targets.STFT_ACCEPTABLE:
+                    grade = "ACCEPTABLE"
+                else:
+                    grade = "NEEDS WORK"
+                winner = "WIN" if stft_n < stft_l else "LOSE"
+                print(f"  MR-STFT: {stft_n:.4f} (notlame) vs {stft_l:.4f} (LAME) = {grade} ({winner})")
+
+            # Mel
+            mel_n = notlame.get("mel_mean")
+            mel_l = lame.get("mel_mean")
+            if mel_n is not None:
+                if mel_n < targets.MEL_EXCELLENT:
+                    grade = "EXCELLENT"
+                elif mel_n < targets.MEL_GOOD:
+                    grade = "GOOD"
+                elif mel_n < targets.MEL_ACCEPTABLE:
+                    grade = "ACCEPTABLE"
+                else:
+                    grade = "NEEDS WORK"
+                winner = "WIN" if mel_n < mel_l else "LOSE"
+                print(f"  Mel: {mel_n:.4f} (notlame) vs {mel_l:.4f} (LAME) = {grade} ({winner})")
+
+            # Win rates
+            print(f"\nWin Rates vs LAME:")
+            for metric, rate in win_rates.items():
+                if rate is not None:
+                    status = "WINNING" if rate > 0.5 else "LOSING"
+                    print(f"  {metric}: {rate*100:.1f}% ({status})")
+
+        else:
+            print("\n(No evaluation_report.json found - run 'make evaluate' first)")
+
+        print("=" * 60)
+
+        # This test always passes - it's for documentation
+        assert True

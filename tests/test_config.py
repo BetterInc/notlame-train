@@ -135,6 +135,65 @@ class TestModelConstants:
         assert NUM_BANDS == 22
 
 
+class TestSampleRateConfig:
+    """Test sample rate configuration."""
+
+    def test_supported_sample_rates(self):
+        """Supported sample rates should include common formats."""
+        assert 44100 in config.SUPPORTED_SAMPLE_RATES
+        assert 48000 in config.SUPPORTED_SAMPLE_RATES
+        assert 32000 in config.SUPPORTED_SAMPLE_RATES
+
+    def test_default_sample_rate(self):
+        """Default sample rate should be supported."""
+        assert config.DEFAULT_SAMPLE_RATE in config.SUPPORTED_SAMPLE_RATES
+
+    def test_model_sample_rate(self):
+        """Model sample rate should match default."""
+        assert config.MODEL_SAMPLE_RATE == config.DEFAULT_SAMPLE_RATE
+        assert config.MODEL_SAMPLE_RATE == 44100
+
+    def test_resample_same_rate(self):
+        """Resampling same rate should return input."""
+        import numpy as np
+        audio = np.random.randn(1000).astype(np.float32)
+        result = config.resample_audio(audio, 44100, 44100)
+        assert result is audio  # Should be same object
+
+    def test_resample_44100_to_48000(self):
+        """Resampling 44.1kHz to 48kHz should increase length."""
+        import numpy as np
+        audio = np.random.randn(44100).astype(np.float32)
+        result = config.resample_audio(audio, 44100, 48000)
+        expected_len = int(44100 * 48000 / 44100)
+        assert abs(len(result) - expected_len) <= 1
+
+    def test_resample_48000_to_44100(self):
+        """Resampling 48kHz to 44.1kHz should decrease length."""
+        import numpy as np
+        audio = np.random.randn(48000).astype(np.float32)
+        result = config.resample_audio(audio, 48000, 44100)
+        expected_len = int(48000 * 44100 / 48000)
+        assert abs(len(result) - expected_len) <= 1
+
+    def test_resample_roundtrip(self):
+        """Resampling roundtrip should roughly preserve signal."""
+        import numpy as np
+        # Create a simple sine wave
+        t = np.linspace(0, 1, 44100, dtype=np.float32)
+        audio = np.sin(2 * np.pi * 440 * t)  # 440Hz sine
+
+        # Roundtrip: 44100 -> 48000 -> 44100
+        up = config.resample_audio(audio, 44100, 48000)
+        down = config.resample_audio(up, 48000, 44100)
+
+        # Should be similar length
+        min_len = min(len(audio), len(down))
+        # Allow some tolerance due to resampling artifacts
+        correlation = np.corrcoef(audio[:min_len], down[:min_len])[0, 1]
+        assert correlation > 0.99, f"Correlation {correlation} too low"
+
+
 class TestConfigConsistency:
     """Test configuration is internally consistent."""
 

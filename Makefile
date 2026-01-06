@@ -10,9 +10,9 @@ PY := $(VENV)/bin/python
 # Directories
 DATA_RAW := data/raw
 DATA_PROCESSED := data/processed
+DATA_TEST := data/test
 CHECKPOINTS := checkpoints
 MODELS := models
-TEST_SAMPLES := tests/samples
 
 # Training config
 BATCH_SIZE ?= 32
@@ -33,7 +33,7 @@ YELLOW := \033[0;33m
 RED := \033[0;31m
 NC := \033[0m
 
-.PHONY: help setup install download validate prepare train evaluate export clean test test-losses test-suite test-beat-lame test-all all
+.PHONY: help setup install download validate prepare train evaluate evaluate-all export clean test test-losses test-suite test-beat-lame test-all all
 
 # Default target
 help:
@@ -62,7 +62,8 @@ help:
 	@echo "  make tensorboard    Start TensorBoard server"
 	@echo ""
 	@echo "$(YELLOW)Evaluation & Export:$(NC)"
-	@echo "  make evaluate       Evaluate model against LAME"
+	@echo "  make evaluate       Evaluate model on test set (20 files)"
+	@echo "  make evaluate-all   Evaluate model on ALL training data (batched GPU)"
 	@echo "  make export         Export model to ONNX"
 	@echo ""
 	@echo "$(YELLOW)Utilities:$(NC)"
@@ -235,14 +236,22 @@ tensorboard: $(VENV)/bin/activate
 # =============================================================================
 
 evaluate: $(VENV)/bin/activate
-	@echo "$(GREEN)Evaluating model...$(NC)"
-	@if [ ! -f "$(CHECKPOINTS)/best.pt" ] && [ ! -f "$(CHECKPOINTS)/final.pt" ]; then \
+	@echo "$(GREEN)Evaluating model on test set...$(NC)"
+	@if [ ! -f "$(CHECKPOINTS)/latest.pt" ] && [ ! -f "$(CHECKPOINTS)/best.pt" ] && [ ! -f "$(CHECKPOINTS)/final.pt" ]; then \
 		echo "$(RED)Error: No checkpoint found$(NC)"; \
 		exit 1; \
 	fi
-	@CKPT=$$([ -f "$(CHECKPOINTS)/best.pt" ] && echo "$(CHECKPOINTS)/best.pt" || echo "$(CHECKPOINTS)/final.pt"); \
-	if [ ! -d "$(TEST_SAMPLES)" ] || [ -z "$$(ls -A $(TEST_SAMPLES) 2>/dev/null)" ]; then \
-		echo "$(YELLOW)Warning: No test samples in $(TEST_SAMPLES), using $(DATA_RAW)$(NC)"; \
+	@CKPT=$$([ -f "$(CHECKPOINTS)/latest.pt" ] && echo "$(CHECKPOINTS)/latest.pt" || ([ -f "$(CHECKPOINTS)/best.pt" ] && echo "$(CHECKPOINTS)/best.pt" || echo "$(CHECKPOINTS)/final.pt")); \
+	if [ -d "$(DATA_TEST)" ] && [ -n "$$(ls -A $(DATA_TEST)/*.wav 2>/dev/null)" ]; then \
+		echo "Using test set: $(DATA_TEST) (20 files, 10 genres)"; \
+		$(PY) -m notlame_train.evaluate \
+			--checkpoint $$CKPT \
+			--test-dir $(DATA_TEST) \
+			--bitrate $(BITRATE) \
+			--model $(MODEL_VARIANT) \
+			--output evaluation_report.json; \
+	else \
+		echo "$(YELLOW)No test set in $(DATA_TEST), using $(DATA_RAW) (max 20 files)$(NC)"; \
 		$(PY) -m notlame_train.evaluate \
 			--checkpoint $$CKPT \
 			--test-dir $(DATA_RAW) \
@@ -250,23 +259,33 @@ evaluate: $(VENV)/bin/activate
 			--model $(MODEL_VARIANT) \
 			--max-files 20 \
 			--output evaluation_report.json; \
-	else \
-		$(PY) -m notlame_train.evaluate \
-			--checkpoint $$CKPT \
-			--test-dir $(TEST_SAMPLES) \
-			--bitrate $(BITRATE) \
-			--model $(MODEL_VARIANT) \
-			--output evaluation_report.json; \
 	fi
 	@echo "$(GREEN)Evaluation complete! See evaluation_report.json$(NC)"
 
-export: $(VENV)/bin/activate
-	@echo "$(GREEN)Exporting model to ONNX...$(NC)"
-	@if [ ! -f "$(CHECKPOINTS)/best.pt" ] && [ ! -f "$(CHECKPOINTS)/final.pt" ]; then \
+evaluate-all: $(VENV)/bin/activate
+	@echo "$(GREEN)Evaluating model on ALL training data...$(NC)"
+	@if [ ! -f "$(CHECKPOINTS)/latest.pt" ] && [ ! -f "$(CHECKPOINTS)/best.pt" ] && [ ! -f "$(CHECKPOINTS)/final.pt" ]; then \
 		echo "$(RED)Error: No checkpoint found$(NC)"; \
 		exit 1; \
 	fi
-	@CKPT=$$([ -f "$(CHECKPOINTS)/best.pt" ] && echo "$(CHECKPOINTS)/best.pt" || echo "$(CHECKPOINTS)/final.pt"); \
+	@CKPT=$$([ -f "$(CHECKPOINTS)/latest.pt" ] && echo "$(CHECKPOINTS)/latest.pt" || ([ -f "$(CHECKPOINTS)/best.pt" ] && echo "$(CHECKPOINTS)/best.pt" || echo "$(CHECKPOINTS)/final.pt")); \
+	$(PY) -m notlame_train.evaluate \
+		--checkpoint $$CKPT \
+		--test-dir $(DATA_RAW)/genres \
+		--bitrate $(BITRATE) \
+		--model $(MODEL_VARIANT) \
+		--batch-size 32 \
+		--workers 8 \
+		--output evaluation_report_full.json
+	@echo "$(GREEN)Full evaluation complete! See evaluation_report_full.json$(NC)"
+
+export: $(VENV)/bin/activate
+	@echo "$(GREEN)Exporting model to ONNX...$(NC)"
+	@if [ ! -f "$(CHECKPOINTS)/latest.pt" ] && [ ! -f "$(CHECKPOINTS)/best.pt" ] && [ ! -f "$(CHECKPOINTS)/final.pt" ]; then \
+		echo "$(RED)Error: No checkpoint found$(NC)"; \
+		exit 1; \
+	fi
+	@CKPT=$$([ -f "$(CHECKPOINTS)/latest.pt" ] && echo "$(CHECKPOINTS)/latest.pt" || ([ -f "$(CHECKPOINTS)/best.pt" ] && echo "$(CHECKPOINTS)/best.pt" || echo "$(CHECKPOINTS)/final.pt")); \
 	$(PY) -m notlame_train.export_onnx \
 		--checkpoint $$CKPT \
 		--output $(MODELS)/psycho_v1.onnx \

@@ -13,9 +13,41 @@ STFT_HOP_SIZES = [16, 32, 64, 128]
 STFT_WIN_SIZES = [64, 128, 256, 512]
 
 # =============================================================================
+# Sample Rate Configuration
+# =============================================================================
+# Supported sample rates (MPEG-1 Layer III)
+SUPPORTED_SAMPLE_RATES = [44100, 48000, 32000]
+DEFAULT_SAMPLE_RATE = 44100
+MODEL_SAMPLE_RATE = 44100  # Model is trained on this sample rate
+
+
+def resample_audio(audio, sr_in: int, sr_out: int):
+    """Resample audio to target sample rate.
+
+    Args:
+        audio: numpy array of audio samples
+        sr_in: Input sample rate
+        sr_out: Output sample rate
+
+    Returns:
+        Resampled audio array
+    """
+    if sr_in == sr_out:
+        return audio
+
+    import numpy as np
+    try:
+        import librosa
+        return librosa.resample(audio, orig_sr=sr_in, target_sr=sr_out)
+    except ImportError:
+        from scipy import signal
+        num_samples = int(len(audio) * sr_out / sr_in)
+        return signal.resample(audio, num_samples).astype(np.float32)
+
+# =============================================================================
 # Multi-Scale Mel Loss Configuration (DAC-style)
 # =============================================================================
-MEL_SAMPLE_RATE = 44100
+MEL_SAMPLE_RATE = DEFAULT_SAMPLE_RATE  # Use default for training
 # Minimum 128 to avoid empty mel filters in librosa
 MEL_WINDOW_LENGTHS = [128, 256, 512]
 MEL_N_MELS = 64
@@ -28,7 +60,7 @@ LOSS_WEIGHTS = {
     "mdct": 0.1,      # MDCT reconstruction (anchor)
     "stft": 1.0,      # MR-STFT (log + linear magnitude)
     "mel": 15.0,      # Multi-scale Mel (primary perceptual loss)
-    "rate": 1.0,      # Rate penalty - must be comparable to mel (was 0.1, too weak!)
+    "rate": 1.5,      # Rate penalty - push for more compression learning
 }
 
 # =============================================================================
