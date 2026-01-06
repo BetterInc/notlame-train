@@ -634,21 +634,19 @@ def evaluate_directory_batched(evaluator: Evaluator, test_dir: Path,
             print(f"    ... and {len(failed) - 5} more")
     print(f"  Loaded {len(audios)} files successfully")
 
-    # Step 2: Process through model in batches
+    # Step 2: Process through model (one at a time for progress visibility)
     print("Processing through neural model...")
     notlame_audios = []
     start_time = time.time()
-    for i in range(0, len(audios), batch_size):
-        batch_audios = audios[i:i+batch_size]
-        batch_srs = sample_rates[i:i+batch_size]
-        batch_results = evaluator.encode_decode_batch(batch_audios, batch_srs)
-        notlame_audios.extend(batch_results)
+    for i, (audio, sr) in enumerate(zip(audios, sample_rates)):
+        result = evaluator.encode_decode(audio, sr)
+        notlame_audios.append(result)
 
-        done = min(i+batch_size, len(audios))
+        done = i + 1
         elapsed = time.time() - start_time
         rate = done / elapsed if elapsed > 0 else 0
         eta = (len(audios) - done) / rate if rate > 0 else 0
-        print(f"  Model: {done}/{len(audios)} files ({rate:.1f}/s, ETA {eta:.0f}s)", end='\r')
+        print(f"  Model: {done}/{len(audios)} files ({rate:.1f}/s, ETA {eta:.0f}s)   ", end='\r', flush=True)
     print(f"  Model: {len(audios)}/{len(audios)} files - done in {time.time()-start_time:.1f}s        ")
 
     # Step 3: Compute LAME encoding and metrics in parallel
