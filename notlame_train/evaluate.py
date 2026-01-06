@@ -17,9 +17,11 @@ Based on evaluation methodologies from:
 import argparse
 import json
 import os
+import random
 import subprocess
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
@@ -569,8 +571,14 @@ def _compute_lame_and_metrics(args: Tuple) -> dict:
 def evaluate_directory_batched(evaluator: Evaluator, test_dir: Path,
                                bitrate: int = 192, max_files: int = None,
                                batch_size: int = 32, num_workers: int = 8,
-                               verbose: bool = True) -> dict:
-    """Evaluate with GPU batching and parallel CPU processing."""
+                               verbose: bool = True, sample: int = None,
+                               seed: int = 42) -> dict:
+    """Evaluate with GPU batching and parallel CPU processing.
+
+    Args:
+        sample: If set, randomly sample this many files from the dataset.
+        seed: Random seed for reproducible sampling.
+    """
     # Find audio files
     extensions = [".wav", ".flac", ".mp3", ".ogg"]
     files = []
@@ -581,7 +589,15 @@ def evaluate_directory_batched(evaluator: Evaluator, test_dir: Path,
     files = [f for f in files if not f.name.startswith("._")]
     files = sorted(set(files))
 
-    if max_files:
+    total_available = len(files)
+
+    # Random sampling (preferred for large datasets)
+    if sample and sample < len(files):
+        random.seed(seed)
+        files = random.sample(files, sample)
+        files = sorted(files)  # Sort for consistent ordering
+        print(f"Randomly sampled {sample} files from {total_available} (seed={seed})")
+    elif max_files:
         files = files[:max_files]
 
     if not files:
@@ -621,12 +637,19 @@ def evaluate_directory_batched(evaluator: Evaluator, test_dir: Path,
     # Step 2: Process through model in batches
     print("Processing through neural model...")
     notlame_audios = []
+    start_time = time.time()
     for i in range(0, len(audios), batch_size):
         batch_audios = audios[i:i+batch_size]
         batch_srs = sample_rates[i:i+batch_size]
         batch_results = evaluator.encode_decode_batch(batch_audios, batch_srs)
         notlame_audios.extend(batch_results)
-        print(f"  Processed {min(i+batch_size, len(audios))}/{len(audios)} files")
+
+        done = min(i+batch_size, len(audios))
+        elapsed = time.time() - start_time
+        rate = done / elapsed if elapsed > 0 else 0
+        eta = (len(audios) - done) / rate if rate > 0 else 0
+        print(f"  Model: {done}/{len(audios)} files ({rate:.1f}/s, ETA {eta:.0f}s)", end='\r')
+    print(f"  Model: {len(audios)}/{len(audios)} files - done in {time.time()-start_time:.1f}s        ")
 
     # Step 3: Compute LAME encoding and metrics in parallel
     print("Computing LAME comparisons and metrics...")
@@ -636,9 +659,16 @@ def evaluate_directory_batched(evaluator: Evaluator, test_dir: Path,
     ]
 
     results = []
+    start_time = time.time()
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        for result in executor.map(_compute_lame_and_metrics, metric_args):
+        for idx, result in enumerate(executor.map(_compute_lame_and_metrics, metric_args)):
             results.append(result)
+            done = idx + 1
+            elapsed = time.time() - start_time
+            rate = done / elapsed if elapsed > 0 else 0
+            eta = (len(metric_args) - done) / rate if rate > 0 else 0
+            print(f"  Metrics: {done}/{len(metric_args)} files ({rate:.1f}/s, ETA {eta:.0f}s)", end='\r')
+    print(f"  Metrics: {len(results)}/{len(metric_args)} files - done in {time.time()-start_time:.1f}s        ")
 
     # Print verbose output
     if verbose:
@@ -940,7 +970,11 @@ Example:
     parser.add_argument("--model", choices=["default", "lite", "large"], default="default",
                         help="Model variant")
     parser.add_argument("--max-files", type=int, default=None,
-                        help="Maximum files to evaluate")
+                        help="Maximum files to evaluate (first N files)")
+    parser.add_argument("--sample", "-s", type=int, default=None,
+                        help="Randomly sample N files from dataset (recommended: 100-200)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for sampling (default: 42)")
     parser.add_argument("--device", default="cuda",
                         help="Device (default: cuda)")
     parser.add_argument("--quiet", "-q", action="store_true",
@@ -987,6 +1021,8 @@ Example:
             batch_size=args.batch_size,
             num_workers=args.workers,
             verbose=not args.quiet,
+            sample=args.sample,
+            seed=args.seed,
         )
 
     # Print report

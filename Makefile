@@ -63,7 +63,7 @@ help:
 	@echo ""
 	@echo "$(YELLOW)Evaluation & Export:$(NC)"
 	@echo "  make evaluate       Evaluate model on test set (20 files)"
-	@echo "  make evaluate-all   Evaluate model on ALL training data (batched GPU)"
+	@echo "  make evaluate-all   Evaluate model on 200 random samples (batched GPU)"
 	@echo "  make export         Export model to ONNX"
 	@echo ""
 	@echo "$(YELLOW)Utilities:$(NC)"
@@ -263,7 +263,7 @@ evaluate: $(VENV)/bin/activate
 	@echo "$(GREEN)Evaluation complete! See evaluation_report.json$(NC)"
 
 evaluate-all: $(VENV)/bin/activate
-	@echo "$(GREEN)Evaluating model on ALL training data...$(NC)"
+	@echo "$(GREEN)Evaluating model on training data (200 random samples)...$(NC)"
 	@if [ ! -f "$(CHECKPOINTS)/latest.pt" ] && [ ! -f "$(CHECKPOINTS)/best.pt" ] && [ ! -f "$(CHECKPOINTS)/final.pt" ]; then \
 		echo "$(RED)Error: No checkpoint found$(NC)"; \
 		exit 1; \
@@ -274,10 +274,11 @@ evaluate-all: $(VENV)/bin/activate
 		--test-dir $(DATA_RAW)/genres \
 		--bitrate $(BITRATE) \
 		--model $(MODEL_VARIANT) \
+		--sample 200 \
 		--batch-size 32 \
 		--workers 8 \
 		--output evaluation_report_full.json
-	@echo "$(GREEN)Full evaluation complete! See evaluation_report_full.json$(NC)"
+	@echo "$(GREEN)Evaluation complete! See evaluation_report_full.json$(NC)"
 
 export: $(VENV)/bin/activate
 	@echo "$(GREEN)Exporting model to ONNX...$(NC)"
